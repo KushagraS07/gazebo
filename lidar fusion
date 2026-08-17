@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""
+lidar_fusion_v2.py — LiDAR complementary fusion (paper final stage)
+  Paper: final_position = lidar_fusion(rnn_output, lidar_data)
+  Output: [X_r2, Y_r2, theta_r2] — full 3D fused position
+
+Changes applied:
+  1. Use logged angle_increment from scan_filtered.csv
+  2. Synchronize all datasets by timestamp (not row truncation)
+  3. WALLS updated to match new indoor_world.sdf geometry
+  4. Compute RMSE/MAE/Std vs ground truth (paper Table 7)
+  5. Save final_theta in output CSV
+  6. Full quaternion helper for yaw extraction
+  7. Use logged range_max from scan_filtered.csv
+"""
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+import glob
+
+LOG_DIR = os.path.expanduser('~/ws_mobile/sensor_logs')
+
+# FIX (multi-session support): same pattern as preprocess_data.py,
+# ekf_fusion.py, and rnn_fusion_v2.py — this used to always load the single
+# fixed filenames (rnn_smoothed_output.csv, scan_filtered.csv, etc.) and
+# write to fixed output filenames, silently overwriting whichever session
+# was processed last. Now loops over every session, processes each
+# independently (LiDAR ray-casting correction is inherently per-timestep
+# and per-session — there's no meaningful way to "combine" sessions here
+# the way rnn_fusion_v2.py combines training sequences), and reports both
+# per-session and pooled RMSE.
+SESSIONS = ['20260712_141740', '20260712_144326']
+# FIX: session 20260714_014615 excluded — dead IMU sensor for that entire
+# recording (see rnn_fusion_v2.py's SESSIONS comment for the full
+# diagnosis). Note: the alpha=0.7 vs 0.98 comparison directly below was
+# originally measured INCLUDING that session's numbers (third value in
+# each RMSE pair) — worth re-running that comparison now that it's
+# excluded, since a session with a broken heading estimate feeding
+# ray-casting could plausibly have skewed which alpha looked better.
+
+# Tested alpha=0.7 (30% LiDAR weight) empirically: RMSE got WORSE across
+# all three sessions (1.5391 vs 1.5328m, 1.6794 vs 1.6732m, 1.1109 vs
+# 1.1027m), consistently in the same direction — meaning this ray-cast
+# correction is, on average, less accurate than the RNN's own position
+# estimate. Reverted to 0.98 (2% LiDAR weight) rather than keep a value
+# that measurably hurt accuracy. The per-beam ray-casting approach here
+# is a coarse geometric heuristic, not true scan-matching (ICP/particle
+# filter) — likely why it can't earn more trust without first improving
+# beam-quality weighting and a match-quality-aware confidence metric.
+# Promoted to a module-level constant (was a local variable inside
+# run_lidar_fusion_single) so other scripts, e.g. noise_evaluation.py, can
+# import and reuse this exact value instead of hardcoding a duplicate.
+ALPHA = 0.98
+
+# ── Wall geometry matching indoor_world.sdf ───────────────────────────────────
+# Verified directly against ~/ws_mobile/src/mobile_robot/model/indoor_world.sdf
+# <pose>/<size> tags. Each entry is (axis, coord, range_min, range_max) — the
+# range is the wall's REAL finite extent along the perpendicular axis, not the
+# outer world bounds. FIX: the previous version stored only (axis, coord) and
+# ray_wall_intersection() checked every wall against the full outer world
+# bounds (-7..7 / -10..10) regardless of the wall's actual length. That's a
+# reasonable approximation for the 4 outer walls (they really do span nearly
+# the full width/height), but the 6 inner walls are much shorter finite
+# segments — e.g. block_north (pose -5.5,3, size 5x0.2) only exists between
+# x=-8 and x=-3, not across the whole world. Any beam whose ray crossed y=3
+# outside that range was getting a false wall hit, corrupting predicted
+# ranges — and therefore estimate_position_correction()'s err_x/err_y — for
+# a potentially large fraction of beams near the inner structures.
+WALLS = [
+    ('y',  7.0,  -10.0,  10.0),   # wall_north: pose(0,7),   size 20.6x0.3
+    ('y', -7.0,  -10.0,  10.0),   # wall_south: pose(0,-7),  size 20.6x0.3
+    ('x', 10.0,   -7.0,   7.0),   # wall_east:  pose(10,0),  size 0.3x14.6
+    ('x',-10.0,   -7.0,   7.0),   # wall_west:  pose(-10,0), size 0.3x14.6
+    ('y',  3.0,   -8.0,  -3.0),   # block_north: pose(-5.5,3), size 5x0.2
+    ('y', -3.0,   -8.0,  -3.0),   # block_south: pose(-5.5,-3), size 5x0.2
+    ('x', -3.0,   -3.0,   3.0),   # block_east:  pose(-3,0),  size 0.2x6
+    ('x', -8.0,   -3.0,   3.0),   # block_west:  pose(-8,0),  size 0.2x6
+    ('y',  2.0,    0.0,   9.0),   # corridor_top:    pose(4.5,2),  size 9x0.2
+    ('y', -2.0,    0.0,   9.0),   # corridor_bottom: pose(4.5,-2), size 9x0.2
+]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def quat_to_yaw(oz: float, ow: float) -> float:
+    """Full quaternion yaw extraction."""
+    return float(np.arctan2(2.0 * ow * oz, 1.0 - 2.0 * oz * oz))
+
+
+def load_csv(path: str) -> pd.DataFrame:
+    print(f"  Loading: {os.path.basename(path)}")
+    return pd.read_csv(path)
+
+
+def load_latest(prefix: str, exclude=('filtered', 'stage')) -> pd.DataFrame:
+    files = glob.glob(os.path.join(LOG_DIR, f'{prefix}_*.csv'))
+    files = [f for f in files if not any(e in f for e in exclude)]
+    if not files:
+        raise FileNotFoundError(f"No CSV for '{prefix}' in {LOG_DIR}")
+    return load_csv(max(files, key=os.path.getctime))
+
+
+def get_timestamp(df: pd.DataFrame) -> np.ndarray:
+    if 'timestamp' in df.columns:
+        return df['timestamp'].values.astype(float)
+    elif 'time_sec' in df.columns:
+        return df['time_sec'].values + df['time_nsec'].values * 1e-9
+    return np.arange(len(df)) / 50.0
+
+
+def sync_to_grid(df: pd.DataFrame, t_grid: np.ndarray,
+                 cols: list) -> np.ndarray:
+    """Interpolate df columns onto t_grid by timestamp."""
+    t_src = get_timestamp(df)
+    out   = np.zeros((len(t_grid), len(cols)), dtype=np.float32)
+    for j, col in enumerate(cols):
+        out[:, j] = np.interp(t_grid, t_src, df[col].values.astype(float))
+    return out
+
+
+def compute_metrics(pred_x, pred_y, gt_x, gt_y):
+    err  = np.sqrt((pred_x - gt_x)**2 + (pred_y - gt_y)**2)
+    return (float(np.sqrt(np.mean(err**2))),
+            float(np.mean(err)),
+            float(np.std(err)))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RAY CASTING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def ray_wall_intersection(robot_x, robot_y, robot_theta,
+                          beam_angle, walls, range_max):
+    """Cast ray and return nearest wall distance, capped at range_max."""
+    world_angle = robot_theta + beam_angle
+    dx = np.cos(world_angle)
+    dy = np.sin(world_angle)
+    best = None
+
+    # FIX: each wall now carries its OWN real extent (range_min, range_max)
+    # verified against indoor_world.sdf, instead of every wall being checked
+    # against the outer world bounds regardless of its actual length.
+    for axis, pos, seg_min, seg_max in walls:
+        if axis == 'x':
+            if abs(dx) < 1e-6:
+                continue
+            t = (pos - robot_x) / dx
+            if t > 0:
+                hit_y = robot_y + t * dy
+                if seg_min <= hit_y <= seg_max:
+                    if best is None or t < best:
+                        best = t
+        else:
+            if abs(dy) < 1e-6:
+                continue
+            t = (pos - robot_y) / dy
+            if t > 0:
+                hit_x = robot_x + t * dx
+                if seg_min <= hit_x <= seg_max:
+                    if best is None or t < best:
+                        best = t
+
+    return min(best, range_max) if best is not None else None
+
+
+def estimate_position_correction(robot_x, robot_y, robot_theta,
+                                 ranges, angle_min,
+                                 angle_increment,   # from logged scan data
+                                 range_max):        # from logged scan data
+    """
+    Compare actual LiDAR ranges vs predicted ranges from known map.
+    Returns (err_x, err_y, confidence).
+    """
+    n_beams      = len(ranges)
+    sample_step  = 30
+    errors_x, errors_y = [], []
+    valid = 0
+
+    for idx in range(0, n_beams, sample_step):
+        r = ranges[idx]
+        if not np.isfinite(r) or r <= 0 or r >= range_max:
+            continue
+
+        beam_angle  = angle_min + idx * angle_increment
+        predicted_r = ray_wall_intersection(robot_x, robot_y, robot_theta,
+                                            beam_angle, WALLS, range_max)
+        if predicted_r is None:
+            continue
+
+        range_error = r - predicted_r
+        world_angle = robot_theta + beam_angle
+        errors_x.append(range_error * np.cos(world_angle))
+        errors_y.append(range_error * np.sin(world_angle))
+        valid += 1
+
+    if valid == 0:
+        return 0.0, 0.0, 0.0
+
+    confidence = min(1.0, valid / 10.0)
+    return float(np.mean(errors_x)), float(np.mean(errors_y)), confidence
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN FUSION
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def run_lidar_fusion_single(session: str):
+    """Run LiDAR complementary fusion for ONE session. Returns
+    (rmse, mae, std, err_array, fused_x, fused_y, fused_theta, rnn_df, gt_sync)
+    or None values for the metric fields if no ground truth is available."""
+    print(f"\n  --- Session {session} ---")
+
+    rnn_path  = os.path.join(LOG_DIR, f'rnn_smoothed_output_{session}.csv')
+    scan_path = os.path.join(LOG_DIR, f'scan_filtered_{session}.csv')
+    odom_path = os.path.join(LOG_DIR, f'odom_filtered_{session}.csv')
+    for p, label in [(rnn_path, 'rnn_smoothed_output'),
+                     (scan_path, 'scan_filtered'),
+                     (odom_path, 'odom_filtered')]:
+        if not os.path.exists(p):
+            print(f"  ⚠️  Missing {label}_{session}.csv — skipping this session. "
+                  f"Run the earlier pipeline stages for session {session} first.")
+            return None
+
+    rnn_df  = load_csv(rnn_path)
+    scan_df = load_csv(scan_path)
+    odom_df = load_csv(odom_path)
+
+    angle_increment = float(scan_df['angle_increment'].iloc[0])
+    range_max       = float(scan_df['range_max'].iloc[0])
+    print(f"  angle_increment = {angle_increment:.6f} rad  (from scan_filtered_{session}.csv)")
+    print(f"  range_max       = {range_max:.3f} m  (from scan_filtered_{session}.csv)")
+
+    rnn_t  = get_timestamp(rnn_df)
+    t_grid = rnn_t
+
+    odom_sync = sync_to_grid(odom_df, t_grid, ['orient_z', 'orient_w'])
+    scan_angle_min = sync_to_grid(scan_df, t_grid, ['angle_min'])[:, 0]
+
+    # FIX: 'range_min'/'range_max' are scalar scan metadata columns, not beam
+    # columns, but they also start with 'range_' — the old filter matched
+    # them too and crashed trying to int()-parse "min"/"max" as a beam
+    # index. Only keep columns whose suffix after 'range_' is a real digit
+    # string (i.e. actual beam columns range_0 .. range_539).
+    range_cols = sorted(
+        [c for c in scan_df.columns
+         if c.startswith('range_') and c.split('_', 1)[1].isdigit()],
+        key=lambda c: int(c.split('_')[1]))
+    print(f"  Syncing {len(range_cols)} LiDAR beams to RNN timestamps...")
+    scan_sync = sync_to_grid(scan_df, t_grid, range_cols)
+
+    n = len(t_grid)
+    print(f"  Processing {n} timesteps")
+
+    alpha = ALPHA
+    fused_x, fused_y, fused_theta = [], [], []
+    confidences = []
+
+    for i in range(n):
+        rnn_x = float(rnn_df['rnn_x'].iloc[i])
+        rnn_y = float(rnn_df['rnn_y'].iloc[i])
+
+        oz    = float(odom_sync[i, 0])
+        ow    = float(odom_sync[i, 1])
+        theta = quat_to_yaw(oz, ow)
+
+        if 'rnn_theta' in rnn_df.columns:
+            theta = float(rnn_df['rnn_theta'].iloc[i])
+
+        ranges     = scan_sync[i]
+        angle_min  = float(scan_angle_min[i])
+
+        err_x, err_y, conf = estimate_position_correction(
+            rnn_x, rnn_y, theta, ranges, angle_min, angle_increment, range_max)
+
+        lidar_x = rnn_x + err_x
+        lidar_y = rnn_y + err_y
+
+        w       = (1 - alpha) * conf
+        final_x = (1 - w) * rnn_x + w * lidar_x
+        final_y = (1 - w) * rnn_y + w * lidar_y
+
+        fused_x.append(final_x)
+        fused_y.append(final_y)
+        fused_theta.append(theta)
+        confidences.append(conf)
+
+    result_df = pd.DataFrame({
+        'timestamp':       t_grid,
+        'rnn_x':           rnn_df['rnn_x'].values,
+        'rnn_y':           rnn_df['rnn_y'].values,
+        'final_x':         fused_x,
+        'final_y':         fused_y,
+        'final_theta':     fused_theta,
+        'lidar_confidence': confidences
+    })
+
+    out_path = os.path.join(LOG_DIR, f'final_fused_output_v2_{session}.csv')
+    result_df.to_csv(out_path, index=False)
+    print(f"\n  Saved: {os.path.basename(out_path)} ({n} rows)")
+
+    # FIX: explicitly target this session's ground_truth_filtered file, not
+    # a ctime-glob across raw/stage/filtered variants (same bug class fixed
+    # earlier in ekf_fusion.py).
+    gt_path = os.path.join(LOG_DIR, f'ground_truth_filtered_{session}.csv')
+    gt_df = None
+    if os.path.exists(gt_path):
+        gt_df = pd.read_csv(gt_path)
+        print(f"  Ground truth: {os.path.basename(gt_path)} (real, cleaned, resampled)")
+    else:
+        print(f"  ⚠️  ground_truth_filtered_{session}.csv not found — "
+              f"skipping RMSE for this session.")
+
+    rmse = mae = std = None
+    err = None
+    gt_sync = None
+    if gt_df is not None:
+        gt_sync = sync_to_grid(gt_df, t_grid, ['gt_x', 'gt_y'])
+        rmse, mae, std = compute_metrics(
+            np.array(fused_x), np.array(fused_y), gt_sync[:, 0], gt_sync[:, 1])
+        err = np.sqrt((np.array(fused_x)-gt_sync[:, 0])**2 +
+                      (np.array(fused_y)-gt_sync[:, 1])**2)
+        print(f"\n  ── Session {session} — Final Fusion Accuracy vs Ground Truth ──")
+        print(f"     RMSE : {rmse:.4f} m  (paper RNN std: 0.0527 m)")
+        print(f"     MAE  : {mae:.4f} m")
+        print(f"     Std  : {std:.4f} m")
+
+    # ── Per-session plot ──────────────────────────────────────────────────────
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    axes[0].plot(rnn_df['rnn_x'], rnn_df['rnn_y'],
+                 label='RNN output', alpha=0.6, color='green')
+    axes[0].plot(fused_x, fused_y,
+                 label='Final [X_r2, Y_r2]', color='purple', linewidth=2)
+    if gt_sync is not None:
+        axes[0].plot(gt_sync[:, 0], gt_sync[:, 1],
+                     label='Ground Truth', color='black', linewidth=1, linestyle='--')
+    axes[0].set_xlabel('X (m)'); axes[0].set_ylabel('Y (m)')
+    axes[0].set_title(f'Final LiDAR Complementary Fusion — {session}')
+    axes[0].legend(); axes[0].grid(True); axes[0].axis('equal')
+
+    axes[1].plot(confidences, color='darkorange')
+    axes[1].set_xlabel('Timestep'); axes[1].set_ylabel('LiDAR Confidence')
+    axes[1].set_title('LiDAR Correction Confidence Over Time')
+    axes[1].grid(True)
+
+    plt.tight_layout()
+    plot_out = os.path.join(LOG_DIR, f'final_fusion_trajectory_v2_{session}.png')
+    plt.savefig(plot_out, dpi=150)
+    plt.close(fig)
+    print(f"  Saved: {os.path.basename(plot_out)}")
+
+    return rmse, mae, std, err, fused_x, fused_y, fused_theta, rnn_df, gt_sync
+
+
+def run_lidar_fusion():
+    print("\n" + "="*55)
+    print("  LiDAR COMPLEMENTARY FUSION (paper final stage)")
+    print(f"  Sessions: {', '.join(SESSIONS)}")
+    print("  Output: [X_r2, Y_r2, theta_r2]")
+    print("="*55)
+
+    all_err = []
+    session_metrics = []
+
+    for session in SESSIONS:
+        result = run_lidar_fusion_single(session)
+        if result is None:
+            continue
+        rmse, mae, std, err, *_ = result
+        if err is not None:
+            all_err.append(err)
+            session_metrics.append({'session': session, 'rmse': rmse,
+                                     'mae': mae, 'std': std})
+
+    if all_err:
+        overall_err = np.concatenate(all_err)
+        overall_rmse = float(np.sqrt(np.mean(overall_err**2)))
+        overall_mae  = float(np.mean(overall_err))
+        overall_std  = float(np.std(overall_err))
+        print(f"\n  ── POOLED (all sessions with ground truth) — Final Fusion Accuracy ──")
+        print(f"     RMSE : {overall_rmse:.4f} m")
+        print(f"     MAE  : {overall_mae:.4f} m")
+        print(f"     Std  : {overall_std:.4f} m")
+
+        session_metrics.append({'session': 'POOLED', 'rmse': overall_rmse,
+                                 'mae': overall_mae, 'std': overall_std})
+        pd.DataFrame(session_metrics).to_csv(
+            os.path.join(LOG_DIR, 'lidar_fusion_metrics.csv'), index=False)
+        print(f"     Saved: lidar_fusion_metrics.csv (per-session + pooled)")
+    else:
+        print("\n  No sessions had ground truth available — no RMSE computed.")
+
+    print("\n✅ LiDAR fusion complete!")
+    print("   Next: python3 ~/ws_mobile/scripts/generate_paper_figures.py")
+
+
+if __name__ == '__main__':
+    run_lidar_fusion()
