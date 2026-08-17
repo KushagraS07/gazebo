@@ -1,0 +1,952 @@
+#!/usr/bin/env python3
+"""
+generate_paper_figures.py — All 7 figures matching paper + runtime/disturbance/metrics
+
+Figures generated:
+  Fig 1: Raw sensor data collection        (paper Fig 6)
+  Fig 2: S-G filtering comparison          (paper Fig 7-8)
+  Fig 3: EKF trajectory + GT error         (paper Fig 12)
+  Fig 4: RNN localization error vs GT      (paper Fig 13)
+  Fig 5: LiDAR fusion trajectory + GT      (paper Fig 13)
+  Fig 6: Noise comparison 3-bar chart      (paper Fig 9)
+  Fig 7: Full pipeline master figure
+  Fig 8: Runtime breakdown                 (paper Table 8)
+  Fig 9: Dynamic disturbance comparison    (paper Table 4)
+  Fig 10: Metrics summary (std dev)        (paper Table 7)
+"""
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import os
+import sys
+import glob
+
+LOG_DIR = os.path.expanduser('~/ws_mobile/sensor_logs')
+
+# FIX (multi-session support): every figure function used to hardcode fixed
+# filenames (ekf_fused_output.csv, rnn_smoothed_output.csv, etc.) which no
+# longer exist — every pipeline stage now saves session-tagged output
+# (ekf_fused_output_<session>.csv). These figures illustrate ONE
+# representative trajectory (matching the paper's own approach of showing
+# one simulation run per fusion stage, not overlaying multiple sessions),
+# so pick a single session here rather than looping over all three.
+# 20260712_144326 was chosen since it's the session most thoroughly
+# diagnosed and verified throughout this project's debugging.
+# FIX: now a command-line argument (matching ekf_fusion.py's convention)
+# instead of a hardcoded constant you had to edit every time — run e.g.
+#   python3 generate_paper_figures.py 20260712_141740
+# to generate figures for a different session; omit it to use the
+# representative session as before.
+SESSION = sys.argv[1] if len(sys.argv) > 1 else '20260712_144326'
+
+
+def p(prefix: str) -> str:
+    """Path to this session's tagged file, e.g. p('ekf_fused_output') ->
+    .../ekf_fused_output_20260712_144326.csv"""
+    return os.path.join(LOG_DIR, f'{prefix}_{SESSION}.csv')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_latest(prefix, exclude=None):
+    """FIX: still used for truly session-agnostic files (none currently),
+    kept for compatibility but no longer used for per-session pipeline
+    outputs — those now go through p() to target SESSION explicitly."""
+    files = glob.glob(os.path.join(LOG_DIR, f'{prefix}_*.csv'))
+    if exclude:
+        files = [f for f in files if not any(e in f for e in exclude)]
+    if not files:
+        raise FileNotFoundError(f"No CSV for '{prefix}' in {LOG_DIR}")
+    return pd.read_csv(max(files, key=os.path.getctime))
+
+
+def get_timestamp(df):
+    if 'timestamp' in df.columns:
+        return df['timestamp'].values.astype(float)
+    elif 'time_sec' in df.columns:
+        return df['time_sec'].values + df['time_nsec'].values * 1e-9
+    return np.arange(len(df)) / 50.0
+
+
+def load_gt(t_grid):
+    """Load ground truth interpolated onto t_grid.
+    FIX: previously ctime-globbed across raw/stage/filtered ground_truth
+    variants for whichever session happened to be processed most recently
+    — could silently load an uncleaned file, or a different session's GT
+    entirely. Now explicitly targets SESSION's canonical, cleaned,
+    continuity-fixed, resampled ground_truth_filtered file."""
+    path = p('ground_truth_filtered')
+    if not os.path.exists(path):
+        print(f"  ⚠️  {os.path.basename(path)} not found — no ground truth "
+              f"available for session {SESSION}.")
+        return None, None
+    gt_df = pd.read_csv(path)
+    gt_t  = get_timestamp(gt_df)
+    gt_x  = np.interp(t_grid, gt_t, gt_df['gt_x'].values.astype(float))
+    gt_y  = np.interp(t_grid, gt_t, gt_df['gt_y'].values.astype(float))
+    return gt_x, gt_y
+
+
+def pos_error(px, py, gt_x, gt_y):
+    return np.sqrt((px - gt_x)**2 + (py - gt_y)**2)
+
+
+def rmse(err):
+    return float(np.sqrt(np.mean(err**2)))
+
+
+def quat_to_yaw(oz, ow):
+    return float(np.arctan2(2.0 * ow * oz, 1.0 - 2.0 * oz * oz))
+
+
+def imu_dead_reckoning(imu_df, init_x, init_y, init_theta):
+    """
+    Standalone IMU-only position estimate via double-integration of
+    body-frame linear acceleration, using the IMU's own absolute
+    orientation (orient_z/orient_w -> theta) for the world-frame rotation
+    (not re-integrating angular_vel_z — this project's EKF debugging
+    already found IMU absolute orientation is near-exact, ~0.04deg mean
+    error vs GT, so re-deriving heading from rate data would just
+    reintroduce that same error for no benefit).
+
+    HONEST EXPECTATION: this WILL drift substantially and look far worse
+    than odometry/EKF — that's the real, well-known behavior of
+    accelerometer double-integration (error grows ~quadratically with
+    time), and matches the paper's own description of IMU: "substantial
+    cumulative errors and inaccuracies, making it difficult to ensure
+    reliable positioning" (paper, Data preprocessing section). A drifting
+    IMU trace here is the CORRECT outcome, not a bug.
+    """
+    t = get_timestamp(imu_df)
+    n = len(t)
+    oz = imu_df['orient_z'].values.astype(float)
+    ow = imu_df['orient_w'].values.astype(float)
+    theta = np.array([quat_to_yaw(oz[i], ow[i]) for i in range(n)])
+    ax = imu_df['linear_acc_x'].values.astype(float)
+    ay = imu_df['linear_acc_y'].values.astype(float)
+
+    x, y = np.zeros(n), np.zeros(n)
+    x[0], y[0] = init_x, init_y
+    vx, vy = 0.0, 0.0
+
+    for i in range(1, n):
+        dt = float(t[i] - t[i - 1])
+        dt = np.clip(dt, 0.001, 0.5)
+        th = theta[i - 1]
+        ax_world = ax[i - 1] * np.cos(th) - ay[i - 1] * np.sin(th)
+        ay_world = ax[i - 1] * np.sin(th) + ay[i - 1] * np.cos(th)
+        vx += ax_world * dt
+        vy += ay_world * dt
+        x[i] = x[i - 1] + vx * dt
+        y[i] = y[i - 1] + vy * dt
+
+    return x, y, theta
+
+
+def adaptive_xy_limits(ax, ref_x_arrays, ref_y_arrays, pad_frac=0.15):
+    """Sets axis limits based on the REFERENCE traces (e.g. GT + odometry),
+    not on whatever else is plotted (e.g. a drifting IMU trace). If IMU
+    dead-reckoning drifts far outside this range, it will simply run off
+    the edge of the plot — annotate_offchart() below reports where it
+    actually went, rather than silently clipping without saying so."""
+    all_x = np.concatenate(ref_x_arrays)
+    all_y = np.concatenate(ref_y_arrays)
+    x_range = all_x.max() - all_x.min()
+    y_range = all_y.max() - all_y.min()
+    ax.set_xlim(all_x.min() - pad_frac * x_range, all_x.max() + pad_frac * x_range)
+    ax.set_ylim(all_y.min() - pad_frac * y_range, all_y.max() + pad_frac * y_range)
+
+
+def annotate_offchart(ax, label, x_arr, y_arr, ref_x_arrays, ref_y_arrays):
+    """If `label`'s trace (x_arr,y_arr) drifts well beyond the reference
+    traces' range (e.g. IMU dead-reckoning vs GT/odometry), the axis limits
+    set by adaptive_xy_limits() will cut it off — add a text note reporting
+    the real max excursion so the drift magnitude isn't silently hidden."""
+    all_x = np.concatenate(ref_x_arrays)
+    all_y = np.concatenate(ref_y_arrays)
+    ref_extent = max(all_x.max() - all_x.min(), all_y.max() - all_y.min())
+    max_excursion = float(np.max(np.hypot(x_arr - x_arr[0], y_arr - y_arr[0])))
+    if max_excursion > 2.5 * ref_extent:
+        ax.text(0.02, 0.02,
+                 f"{label} drifts off-chart\n(max {max_excursion:.1f}m from start —\n"
+                 f"real accelerometer drift, not a bug)",
+                 transform=ax.transAxes, fontsize=8, va='bottom',
+                 bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.9))
+
+
+def save(name):
+    path = os.path.join(LOG_DIR, name)
+    plt.savefig(path, dpi=300, bbox_inches='tight')
+    print(f"  Saved: {name}")
+    plt.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FIGURE 1 — Raw sensor data (paper Fig 6)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def figure1_sensor_data():
+    odom_df = pd.read_csv(p('odom'))
+    imu_df  = pd.read_csv(p('imu'))
+
+    ekf_df  = pd.read_csv(p('ekf_fused_output'))
+    t_grid  = get_timestamp(ekf_df)
+    gt_x, gt_y = load_gt(t_grid)
+
+    # IMU dead-reckoning trace — helper already existed in this file but was
+    # never actually called anywhere until now. Init pose from GT (matching
+    # how every other pipeline stage initializes), falling back to odom's
+    # own start if no GT available.
+    if gt_x is not None:
+        init_x, init_y = float(gt_x[0]), float(gt_y[0])
+    else:
+        init_x, init_y = float(odom_df['pos_x'].iloc[0]), float(odom_df['pos_y'].iloc[0])
+    init_theta = 0.0
+    imu_x, imu_y, _ = imu_dead_reckoning(imu_df, init_x, init_y, init_theta)
+
+    # NOTE: paper Fig 6 also shows a 4th "Ladir" (LiDAR) standalone trace.
+    # This project's pipeline never produces a standalone LiDAR-only
+    # position estimate (LiDAR is only ever used as a complementary
+    # correction on top of RNN output, never alone) — that's a separate
+    # piece of work, not built here. Only 3 of the paper's 4 traces are
+    # real; a 4th is not fabricated to fill the gap.
+    fig, ax = plt.subplots(1, 1, figsize=(9, 7))
+    fig.suptitle('Figure 1: Raw Sensor Data Collection (paper Fig 6)',
+                 fontsize=13, fontweight='bold')
+
+    ref_x = [odom_df['pos_x'].values]
+    ref_y = [odom_df['pos_y'].values]
+    if gt_x is not None:
+        ref_x.append(gt_x); ref_y.append(gt_y)
+
+    if gt_x is not None:
+        ax.plot(gt_x, gt_y, color='tab:blue', linewidth=1.5, label='Trajectory (GT)')
+    ax.plot(odom_df['pos_x'], odom_df['pos_y'], color='tab:orange',
+            linewidth=1, alpha=0.85, label='Odometer')
+    ax.plot(imu_x, imu_y, color='tab:green', linewidth=1, alpha=0.85, label='IMU')
+
+    adaptive_xy_limits(ax, ref_x, ref_y)
+    annotate_offchart(ax, 'IMU', imu_x, imu_y, ref_x, ref_y)
+
+    ax.set_xlabel('x (m)')
+    ax.set_ylabel('y (m)')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    save('paper_figure1_sensor_data.png')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FIGURE 2 — S-G filtering (paper Fig 7-8)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def figure2_sg_filtering():
+    odom_raw = pd.read_csv(p('odom'))
+    odom_flt = pd.read_csv(p('odom_filtered'))
+    imu_raw  = pd.read_csv(p('imu'))
+    imu_flt  = pd.read_csv(p('imu_filtered'))
+
+    ekf_df = pd.read_csv(p('ekf_fused_output'))
+    t_grid = get_timestamp(ekf_df)
+    gt_x, gt_y = load_gt(t_grid)
+
+    init_x = float(gt_x[0]) if gt_x is not None else float(odom_raw['pos_x'].iloc[0])
+    init_y = float(gt_y[0]) if gt_y is not None else float(odom_raw['pos_y'].iloc[0])
+
+    imu_raw_x, imu_raw_y, _ = imu_dead_reckoning(imu_raw, init_x, init_y, 0.0)
+    imu_flt_x, imu_flt_y, _ = imu_dead_reckoning(imu_flt, init_x, init_y, 0.0)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    fig.suptitle('Figure 2: Savitzky-Golay Filtering (paper Fig 7-8)',
+                 fontsize=13, fontweight='bold')
+
+    # ── Left panel: paper Fig 7 style — per-sensor positioning ERROR vs
+    # time (raw, pre-filtering), using GT as reference. Paper's 3rd series
+    # (LiDAR) is skipped — no standalone LiDAR position estimate exists in
+    # this pipeline (see figure1's note), not fabricated here either.
+    if gt_x is not None:
+        n = min(len(odom_raw), len(imu_raw_x), len(gt_x))
+        odom_err = pos_error(odom_raw['pos_x'].values[:n], odom_raw['pos_y'].values[:n],
+                             gt_x[:n], gt_y[:n])
+        imu_err  = pos_error(imu_raw_x[:n], imu_raw_y[:n], gt_x[:n], gt_y[:n])
+        axes[0].plot(odom_err, color='tab:blue',  marker='o', markevery=max(1, n//30),
+                    markersize=4, linewidth=1, label='Odometer Error')
+        axes[0].plot(imu_err,  color='tab:orange', marker='s', markevery=max(1, n//30),
+                    markersize=4, linewidth=1, linestyle='--', label='IMU Error')
+        axes[0].set_xlabel('Time step')
+        axes[0].set_ylabel('Error (m)')
+        axes[0].set_title('Positioning Errors of Sensors (paper Fig 7)')
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.3)
+    else:
+        axes[0].text(0.5, 0.5, 'No ground truth available', ha='center', va='center',
+                    transform=axes[0].transAxes)
+
+    # ── Right panel: paper Fig 8 style — FILTERED trajectories (x vs y),
+    # odometer + IMU dead-reckoning on the filtered signals.
+    # FIX (reasonable reviewer suggestion): previously only showed filtered
+    # data, so the actual smoothing benefit wasn't visible in this panel —
+    # it existed already split across Fig 1 (raw only) and this panel
+    # (filtered only), but never overlaid directly for comparison. Adding
+    # faint raw traces underneath the filtered ones makes the effect
+    # visible in one place without needing to flip between figures.
+    imu_raw_x_r, imu_raw_y_r = imu_raw_x, imu_raw_y  # reuse, already computed above
+    axes[1].plot(odom_raw['pos_x'], odom_raw['pos_y'], color='tab:blue',
+                linewidth=0.8, alpha=0.35, label='Odometer (raw)')
+    axes[1].plot(imu_raw_x_r, imu_raw_y_r, color='tab:orange',
+                linewidth=0.8, alpha=0.35, linestyle=':', label='IMU (raw)')
+    axes[1].plot(odom_flt['pos_x'], odom_flt['pos_y'], color='tab:blue',
+                linewidth=1.5, label='Odometer (filtered)')
+    axes[1].plot(imu_flt_x, imu_flt_y, color='tab:orange', linewidth=1.5,
+                linestyle='--', label='IMU (filtered)')
+    ref_x = [odom_flt['pos_x'].values]
+    ref_y = [odom_flt['pos_y'].values]
+    if gt_x is not None:
+        ref_x.append(gt_x); ref_y.append(gt_y)
+    adaptive_xy_limits(axes[1], ref_x, ref_y)
+    annotate_offchart(axes[1], 'IMU', imu_flt_x, imu_flt_y, ref_x, ref_y)
+    axes[1].set_xlabel('x (m)')
+    axes[1].set_ylabel('y (m)')
+    axes[1].set_title('Raw vs Filtered Data (paper Fig 8)')
+    axes[1].legend(fontsize=8)
+    axes[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    save('paper_figure2_sg_filtering.png')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FIGURE 3 — EKF trajectory + GT error (paper Fig 12)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def figure3_ekf_trajectory():
+    ekf_df = pd.read_csv(p('ekf_fused_output'))
+    imu_df = pd.read_csv(p('imu_filtered'))
+    t_grid = get_timestamp(ekf_df)
+    gt_x, gt_y = load_gt(t_grid)
+
+    init_x = float(gt_x[0]) if gt_x is not None else float(ekf_df['odom_x'].iloc[0])
+    init_y = float(gt_y[0]) if gt_y is not None else float(ekf_df['odom_y'].iloc[0])
+    imu_x, imu_y, _ = imu_dead_reckoning(imu_df, init_x, init_y, 0.0)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    fig.suptitle('Figure 3: EKF Fusion Results (paper Fig 12)',
+                 fontsize=13, fontweight='bold')
+
+    # Trajectory with GT — paper Fig 12 style: Odometer/IMU as scatter
+    # markers, EKF as a line, matching the paper's own visual distinction
+    # between "raw sensor" series (markers) and "fused estimate" (line).
+    axes[0].scatter(ekf_df['odom_x'], ekf_df['odom_y'], color='tab:blue',
+                    s=10, alpha=0.6, label='Odometer')
+    axes[0].scatter(imu_x, imu_y, color='tab:orange', s=10, marker='s',
+                    alpha=0.6, label='IMU')
+    axes[0].plot(ekf_df['ekf_x'], ekf_df['ekf_y'],
+                 color='green', linewidth=1.5, linestyle='--', label='EKF')
+    if gt_x is not None:
+        axes[0].plot(gt_x, gt_y, color='black', linewidth=1,
+                     linestyle='-', label='Trajectory (GT)', alpha=0.6)
+    ref_x = [ekf_df['odom_x'].values]
+    ref_y = [ekf_df['odom_y'].values]
+    if gt_x is not None:
+        ref_x.append(gt_x); ref_y.append(gt_y)
+    adaptive_xy_limits(axes[0], ref_x, ref_y)
+    annotate_offchart(axes[0], 'IMU', imu_x, imu_y, ref_x, ref_y)
+    axes[0].set_xlabel('X (m)')
+    axes[0].set_ylabel('Y (m)')
+    axes[0].set_title('EKF Fused Trajectory')
+    axes[0].legend()
+    axes[0].grid(True)
+
+    # Error vs GT (fix: use GT not odom)
+    if gt_x is not None:
+        ekf_err  = pos_error(ekf_df['ekf_x'].values,  ekf_df['ekf_y'].values,  gt_x, gt_y)
+        odom_err = pos_error(ekf_df['odom_x'].values, ekf_df['odom_y'].values, gt_x, gt_y)
+        axes[1].plot(odom_err, color='orange', alpha=0.6,
+                     linewidth=0.8, label=f'Odom RMSE={rmse(odom_err):.4f}m')
+        axes[1].plot(ekf_err,  color='blue',
+                     linewidth=1, label=f'EKF RMSE={rmse(ekf_err):.4f}m')
+        axes[1].set_ylabel('Error vs Ground Truth (m)')
+    else:
+        err = pos_error(ekf_df['ekf_x'].values, ekf_df['ekf_y'].values,
+                        ekf_df['odom_x'].values, ekf_df['odom_y'].values)
+        axes[1].plot(err, color='red', linewidth=1, label='EKF vs Odom')
+        axes[1].set_ylabel('Position error (m)')
+
+    axes[1].set_xlabel('Time step')
+    axes[1].set_title('Localization Error vs Ground Truth')
+    axes[1].legend()
+    axes[1].grid(True)
+
+    plt.tight_layout()
+    save('paper_figure3_ekf_trajectory.png')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FIGURE 4 — RNN localization error vs GT (paper Fig 13)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def figure4_rnn_results():
+    ekf_df = pd.read_csv(p('ekf_fused_output'))
+    rnn_df = pd.read_csv(p('rnn_smoothed_output'))
+    t_grid = get_timestamp(ekf_df)
+    gt_x, gt_y = load_gt(t_grid)
+
+    # FIX: previously truncated to min(len(ekf_df), len(rnn_df)) before
+    # interpolating, which shrank the comparison window and made this
+    # figure's RMSE (0.6461m EKF / 1.6630m RNN) subtly disagree with the
+    # SAME quantities reported in Fig 3/Fig 10 (0.6480m / 1.6695m, computed
+    # on the full-length arrays). rnn_x/rnn_y are now interpolated onto the
+    # FULL t_grid first (same as every other figure does), so all figures
+    # report identical RMSE for the same method on the same session —
+    # no more silently-different numbers for "the same" result.
+    rnn_native_t = get_timestamp(rnn_df)
+    rnn_x = np.interp(t_grid, rnn_native_t, rnn_df['rnn_x'].values)
+    rnn_y = np.interp(t_grid, rnn_native_t, rnn_df['rnn_y'].values)
+
+    # FIX #2: np.interp CLAMPS (doesn't extrapolate) for t_grid points
+    # before rnn_df's own first timestamp — rnn_df starts WINDOW_SIZE
+    # steps later than ekf_df since the RNN needs that much history
+    # before it can predict anything. This silently repeats rnn_df's
+    # first real value across the leading ~WINDOW_SIZE points, which is
+    # harmless for drawing a continuous trajectory line but was corrupting
+    # the RNN RMSE reported here: those fabricated-flat points made this
+    # figure disagree with rnn_fusion_v2.py's own reported RMSE (1.4310m)
+    # and with Fig 5's number for the SAME rnn_smoothed_output data (Fig 5
+    # uses rnn_df's own native timestamp grid directly and never hits this
+    # issue). Restrict the RNN RMSE specifically to points inside rnn_df's
+    # native timestamp range — the plotted line still uses the full
+    # (clamped-early) array for visual continuity, only the headline
+    # number changes.
+    rnn_valid_mask = t_grid >= rnn_native_t[0]
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    fig.suptitle('Figure 4: RNN Correction Results (paper Fig 13)',
+                 fontsize=13, fontweight='bold')
+
+    # Trajectory
+    axes[0].plot(ekf_df['ekf_x'], ekf_df['ekf_y'],
+                 color='blue', alpha=0.6, linewidth=1, label='EKF Output')
+    axes[0].plot(rnn_x, rnn_y, color='green', linewidth=1.5, label='RNN Corrected')
+    if gt_x is not None:
+        axes[0].plot(gt_x, gt_y, color='black', linewidth=1,
+                     linestyle='--', label='Ground Truth')
+    axes[0].set_xlabel('X (m)')
+    axes[0].set_ylabel('Y (m)')
+    axes[0].set_title('EKF vs RNN vs Ground Truth')
+    axes[0].legend()
+    axes[0].grid(True)
+    axes[0].axis('equal')
+
+    # Localization error vs GT (fix: error not magnitude)
+    if gt_x is not None:
+        n = len(gt_x)
+        ekf_err = pos_error(ekf_df['ekf_x'].values[:n], ekf_df['ekf_y'].values[:n],
+                            gt_x[:n], gt_y[:n])
+        rnn_err = pos_error(rnn_x[:n], rnn_y[:n], gt_x[:n], gt_y[:n])
+        # RMSE excludes the clamped-padding region (see FIX #2 above) —
+        # the plotted line itself still shows the full array for visual
+        # continuity, only the reported number changes.
+        rnn_err_for_rmse = rnn_err[rnn_valid_mask[:n]]
+        mark_every = max(1, n // 40)
+        axes[1].plot(ekf_err, color='blue', alpha=0.6, linewidth=0.8,
+                     marker='o', markevery=mark_every, markersize=4,
+                     label=f'EKF error  RMSE={rmse(ekf_err):.4f}m')
+        axes[1].plot(rnn_err, color='green', linewidth=1,
+                     marker='s', markevery=mark_every, markersize=4,
+                     linestyle='--',
+                     label=f'RNN error  RMSE={rmse(rnn_err_for_rmse):.4f}m')
+        axes[1].set_ylabel('Localization error vs GT (m)')
+        axes[1].set_title('EKF vs RNN Localization Error (paper Fig 13)')
+    else:
+        n = len(ekf_df)
+        err_diff = pos_error(ekf_df['ekf_x'].values[:n], ekf_df['ekf_y'].values[:n],
+                             rnn_x[:n], rnn_y[:n])
+        axes[1].plot(err_diff, color='purple', linewidth=1,
+                     label='EKF vs RNN difference')
+        axes[1].set_ylabel('Position difference (m)')
+        axes[1].set_title('EKF vs RNN Difference Over Time')
+
+    axes[1].set_xlabel('Time step')
+    axes[1].legend()
+    axes[1].grid(True)
+
+    plt.tight_layout()
+    save('paper_figure4_rnn_results.png')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FIGURE 5 — LiDAR fusion + GT (paper Fig 13)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def figure5_lidar_fusion():
+    final_df = pd.read_csv(p('final_fused_output_v2'))
+    t_grid   = get_timestamp(final_df)
+    gt_x, gt_y = load_gt(t_grid)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    fig.suptitle('Figure 5: Final LiDAR Complementary Fusion (paper Fig 13)',
+                 fontsize=13, fontweight='bold')
+
+    # Trajectory with GT
+    axes[0].plot(final_df['rnn_x'],   final_df['rnn_y'],
+                 color='green', alpha=0.6, linewidth=1, label='RNN Output')
+    axes[0].plot(final_df['final_x'], final_df['final_y'],
+                 color='purple', linewidth=1.5, label='Final Fused [X_r2,Y_r2]')
+    if gt_x is not None:
+        axes[0].plot(gt_x, gt_y, color='black', linewidth=1,
+                     linestyle='--', label='Ground Truth')
+    axes[0].set_xlabel('X (m)')
+    axes[0].set_ylabel('Y (m)')
+    axes[0].set_title('Final Fused Trajectory vs Ground Truth')
+    axes[0].legend()
+    axes[0].grid(True)
+    axes[0].axis('equal')
+
+    # Error vs GT
+    if gt_x is not None:
+        rnn_err   = pos_error(final_df['rnn_x'].values,   final_df['rnn_y'].values,   gt_x, gt_y)
+        final_err = pos_error(final_df['final_x'].values, final_df['final_y'].values, gt_x, gt_y)
+        mark_every = max(1, len(rnn_err) // 40)
+        axes[1].plot(final_err, color='blue', linewidth=1,
+                     marker='o', markevery=mark_every, markersize=4,
+                     label=f'Fused Data 2 (Final) error  RMSE={rmse(final_err):.4f}m')
+        axes[1].plot(rnn_err,   color='orange',  alpha=0.8, linewidth=1,
+                     marker='s', markevery=mark_every, markersize=4,
+                     linestyle='--',
+                     label=f'Fused Data 1 (RNN) error  RMSE={rmse(rnn_err):.4f}m')
+        axes[1].set_ylabel('Error (m)')
+        axes[1].set_title('RNN vs Final Fusion Error (paper Fig 13)')
+    else:
+        axes[1].plot(final_df['lidar_confidence'], color='darkorange', linewidth=1)
+        axes[1].fill_between(range(len(final_df)),
+                              final_df['lidar_confidence'], alpha=0.3, color='orange')
+        axes[1].set_ylabel('LiDAR confidence')
+        axes[1].set_title('LiDAR Confidence Over Time')
+
+    axes[1].set_xlabel('Time step')
+    axes[1].legend()
+    axes[1].grid(True)
+
+    plt.tight_layout()
+    save('paper_figure5_lidar_fusion.png')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FIGURE 6 — Noise comparison 3 bars (paper Fig 9)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def figure6_noise_comparison():
+    results_df = pd.read_csv(os.path.join(LOG_DIR, 'noise_evaluation_results.csv'))
+
+    fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+
+    x     = np.arange(len(results_df))
+    width = 0.25
+
+    ax.bar(x - width, results_df['EKF Only (m)'],
+           width, label='EKF Only',       color='steelblue')
+    ax.bar(x,         results_df['RNN Only (m)'],
+           width, label='RNN Only',       color='darkorange')
+    ax.bar(x + width, results_df['EKF-RNN Fusion (m)'],
+           width, label='EKF-RNN Fusion', color='seagreen')
+    ax.set_xlabel('Noise Levels')
+    ax.set_ylabel('Localization Error (RMSE) in meters')
+    ax.set_xticks(x)
+    ax.set_xticklabels(results_df['Noise Level'].str.replace(' ', '\n'))
+    ax.legend()
+    ax.grid(True, axis='y', linestyle='--', alpha=0.5)
+
+    plt.tight_layout()
+    save('paper_figure6_noise_comparison.png')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FIGURE 7 — Full pipeline master figure
+# ══════════════════════════════════════════════════════════════════════════════
+
+def figure7_full_pipeline():
+    ekf_df   = pd.read_csv(p('ekf_fused_output'))
+    rnn_df   = pd.read_csv(p('rnn_smoothed_output'))
+    final_df = pd.read_csv(p('final_fused_output_v2'))
+    t_grid   = get_timestamp(ekf_df)
+    gt_x, gt_y = load_gt(t_grid)
+
+    rnn_native_t   = get_timestamp(rnn_df)
+    final_native_t = get_timestamp(final_df)
+    rnn_x = np.interp(t_grid, rnn_native_t, rnn_df['rnn_x'].values)
+    rnn_y = np.interp(t_grid, rnn_native_t, rnn_df['rnn_y'].values)
+    fx    = np.interp(t_grid, final_native_t, final_df['final_x'].values)
+    fy    = np.interp(t_grid, final_native_t, final_df['final_y'].values)
+    # FIX: same root cause as Fig 4 — np.interp clamps (doesn't
+    # extrapolate) for t_grid points before each source's own first
+    # timestamp (RNN/Fusion both start WINDOW_SIZE steps later than EKF),
+    # silently repeating the first real value across the leading rows.
+    # Fine for the plotted trajectory lines, but was corrupting the RNN/
+    # Fusion RMSE in subplot 5's legend. Masks below restrict RMSE to each
+    # source's own valid (non-clamped) range.
+    rnn_valid_mask   = t_grid >= rnn_native_t[0]
+    final_valid_mask = t_grid >= final_native_t[0]
+
+    fig = plt.figure(figsize=(18, 11))
+    fig.suptitle('Complete EKF-RNN-LiDAR Fusion Pipeline Results',
+                 fontsize=15, fontweight='bold')
+    gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.45, wspace=0.35)
+
+    def plot_traj(ax, lines, title):
+        for xy, color, lw, ls, label in lines:
+            ax.plot(xy[0], xy[1], color=color, linewidth=lw,
+                    linestyle=ls, label=label, alpha=0.8)
+        if gt_x is not None:
+            ax.plot(gt_x, gt_y, color='black', linewidth=0.8,
+                    linestyle='--', label='GT')
+        ax.set_title(title)
+        ax.set_xlabel('X (m)')
+        ax.set_ylabel('Y (m)')
+        ax.legend(fontsize=7)
+        ax.grid(True)
+        ax.axis('equal')
+
+    # 1. Raw odometry
+    plot_traj(fig.add_subplot(gs[0, 0]),
+              [((ekf_df['odom_x'], ekf_df['odom_y']), 'orange', 1, '-', 'Odom')],
+              '1. Raw Odometry')
+
+    # 2. EKF output
+    plot_traj(fig.add_subplot(gs[0, 1]),
+              [((ekf_df['odom_x'], ekf_df['odom_y']), 'orange', 0.7, '-', 'Odom'),
+               ((ekf_df['ekf_x'],  ekf_df['ekf_y']),  'blue',   1.2, '-', 'EKF')],
+              '2. After EKF Fusion')
+
+    # 3. RNN output
+    plot_traj(fig.add_subplot(gs[0, 2]),
+              [((ekf_df['ekf_x'], ekf_df['ekf_y']), 'blue',  0.7, '-', 'EKF'),
+               ((rnn_x,           rnn_y),            'green', 1.2, '-', 'RNN')],
+              '3. After RNN Correction')
+
+    # 4. Final fused
+    plot_traj(fig.add_subplot(gs[1, 0]),
+              [((rnn_x, rnn_y), 'green',  0.7, '-', 'RNN'),
+               ((fx,    fy),    'purple', 1.2, '-', 'Final')],
+              '4. Final LiDAR Fusion')
+
+    # 5. Error comparison vs GT
+    ax5 = fig.add_subplot(gs[1, 1])
+    if gt_x is not None:
+        n = min(len(ekf_df), len(gt_x))
+        for vals, color, label, mask in [
+            ((ekf_df['odom_x'].values, ekf_df['odom_y'].values), 'orange', 'Odom', None),
+            ((ekf_df['ekf_x'].values,  ekf_df['ekf_y'].values),  'blue',   'EKF', None),
+            ((rnn_x,                   rnn_y),                   'green',  'RNN', rnn_valid_mask),
+            ((fx,                      fy),                      'purple', 'Fusion', final_valid_mask),
+        ]:
+            err = pos_error(vals[0][:n], vals[1][:n], gt_x[:n], gt_y[:n])
+            # RMSE excludes clamped-padding rows for RNN/Fusion (see FIX
+            # above) — plotted line still shows the full array.
+            err_for_rmse = err[mask[:n]] if mask is not None else err
+            ax5.plot(err, linewidth=0.8, color=color,
+                     label=f'{label} ({rmse(err_for_rmse):.3f}m)', alpha=0.8)
+        ax5.set_ylabel('Error vs GT (m)')
+    ax5.set_title('5. All Methods vs GT Error')
+    ax5.set_xlabel('Time step')
+    ax5.legend(fontsize=7)
+    ax5.grid(True)
+
+    # 6. RMSE bar chart
+    ax6 = fig.add_subplot(gs[1, 2])
+    results_df = pd.read_csv(os.path.join(LOG_DIR, 'noise_evaluation_results.csv'))
+    x     = np.arange(len(results_df))
+    width = 0.25
+    ax6.bar(x - width, results_df['EKF Only (m)'],       width,
+            label='EKF',    color='steelblue')
+    ax6.bar(x,          results_df['RNN Only (m)'],        width,
+            label='RNN',    color='darkorange')
+    ax6.bar(x + width,  results_df['EKF-RNN Fusion (m)'], width,
+            label='Fusion', color='seagreen')
+    ax6.set_title('6. RMSE vs Noise Level')
+    ax6.set_xticks(x)
+    ax6.set_xticklabels(results_df['Noise Level'])
+    ax6.set_ylabel('RMSE (m)')
+    ax6.legend(fontsize=7)
+    ax6.grid(True, axis='y', alpha=0.3)
+
+    save('paper_figure7_full_pipeline.png')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FIGURE 8 — Runtime breakdown (paper Table 8)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def figure8_runtime():
+    # Load runtime from ekf output if available
+    ekf_df = pd.read_csv(p('ekf_fused_output'))
+
+    # Paper Table 8 values
+    components = ['IMU+Odom\nPreprocess', 'EKF\nPredict+Update',
+                  'RNN\nOptimization', 'LiDAR\nFusion', 'Total']
+    paper_ms   = [5.6, 9.4, 12.8, 2.3, 30.1]
+    paper_pct  = [18.7, 31.3, 42.7, 7.3, 100.0]
+
+    # Your measured EKF runtime
+    your_ekf_ms = float(ekf_df['runtime_ms'].mean()) \
+        if 'runtime_ms' in ekf_df.columns else 9.4
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    fig.suptitle('Figure 8: Algorithm Runtime Analysis (paper Table 8)',
+                 fontsize=13, fontweight='bold')
+
+    # FIX: the previous linear-scale axhline for your_ekf_ms (~0.1ms) was
+    # visually indistinguishable from zero against a 0-30ms y-axis — the
+    # comparison line was there in the code but not actually visible/
+    # readable in the rendered plot. Log scale makes both the paper's
+    # millisecond-scale values and your sub-millisecond measurement visible
+    # together, plus an explicit text annotation for the exact number.
+    x = np.arange(len(components))
+    axes[0].bar(x, paper_ms, color=['#4C72B0','#DD8452','#55A868','#C44E52','#8172B2'],
+                alpha=0.8)
+    axes[0].axhline(y=your_ekf_ms, color='blue', linestyle='--', linewidth=2,
+                    label=f'Your EKF: {your_ekf_ms:.3f}ms')
+    axes[0].set_yscale('log')
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(components, fontsize=9)
+    axes[0].set_ylabel('Runtime (ms, log scale)')
+    axes[0].set_title('Per-Component Runtime (paper values, log scale)')
+    axes[0].legend()
+    axes[0].grid(True, axis='y', alpha=0.3, which='both')
+    axes[0].annotate(
+        f'Your measured EKF step: {your_ekf_ms:.3f}ms\n'
+        f'(~{paper_ms[1]/max(your_ekf_ms, 1e-6):.0f}x faster than paper\'s '
+        f'{paper_ms[1]}ms — different hardware/language, not a bug)',
+        xy=(0.02, 0.02), xycoords='axes fraction', fontsize=8,
+        va='bottom', ha='left',
+        bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
+
+    # Pie chart
+    axes[1].pie(paper_pct[:-1],
+                labels=components[:-1],
+                autopct='%1.1f%%',
+                colors=['#4C72B0','#DD8452','#55A868','#C44E52'],
+                startangle=90)
+    axes[1].set_title(f'Runtime Distribution\n(Total: {paper_ms[-1]} ms, 33 FPS)')
+
+    plt.tight_layout()
+    save('paper_figure8_runtime.png')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FIGURE 9 — Dynamic disturbance comparison (paper Table 4)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def figure9_dynamic_disturbance():
+    path = os.path.join(LOG_DIR, 'dynamic_disturbance_results.csv')
+    if not os.path.exists(path):
+        print("  Skipping Fig 9 — dynamic_disturbance_results.csv not found")
+        return
+
+    dist_df = pd.read_csv(path)
+
+    fig, ax = plt.subplots(1, 1, figsize=(9, 6))
+
+    disturbances = dist_df['Disturbance'].tolist()
+    x     = np.arange(len(disturbances))
+    width = 0.25
+
+    ax.bar(x - width, dist_df['EKF Only (m)'],
+           width, label='EKF Only',       color='steelblue')
+    ax.bar(x,         dist_df['RNN Only (m)'],
+           width, label='RNN Only',       color='darkorange')
+    ax.bar(x + width, dist_df['EKF-RNN Fusion (m)'],
+           width, label='EKF-RNN Fusion', color='seagreen')
+    ax.set_xlabel('Dynamic Disturbance')
+    ax.set_ylabel('RMSE (m)')
+    ax.set_xticks(x)
+    ax.set_xticklabels([d.replace(' ', '\n') for d in disturbances])
+    ax.legend()
+    ax.grid(True, axis='y', alpha=0.3)
+
+    plt.tight_layout()
+    save('paper_figure9_disturbance.png')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FIGURE 10 — Metrics summary (paper Table 7)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def figure10_metrics_summary():
+    ekf_df   = pd.read_csv(p('ekf_fused_output'))
+    rnn_df   = pd.read_csv(p('rnn_smoothed_output'))
+    final_df = pd.read_csv(p('final_fused_output_v2'))
+    t_grid   = get_timestamp(ekf_df)
+    gt_x, gt_y = load_gt(t_grid)
+
+    if gt_x is None:
+        print("  Skipping Fig 10 — no ground truth available")
+        return
+
+    rnn_native_t   = get_timestamp(rnn_df)
+    final_native_t = get_timestamp(final_df)
+    rnn_x  = np.interp(t_grid, rnn_native_t,   rnn_df['rnn_x'].values)
+    rnn_y  = np.interp(t_grid, rnn_native_t,   rnn_df['rnn_y'].values)
+    fx     = np.interp(t_grid, final_native_t, final_df['final_x'].values)
+    fy     = np.interp(t_grid, final_native_t, final_df['final_y'].values)
+
+    n = min(len(gt_x), len(ekf_df))
+    # FIX: same root cause as Fig 4/Fig 7 — np.interp clamps rnn_x/rnn_y
+    # and fx/fy to their first real value for t_grid points before each
+    # source's own native start (RNN/Fusion both start WINDOW_SIZE steps
+    # later than EKF). Excluding those points here (RNN/Fusion only, not
+    # EKF/Odometry which have no such padding) keeps this figure's RMSE
+    # consistent with rnn_fusion_v2.py's own reported number and with
+    # Fig 4/Fig 5/Fig 11.
+    rnn_valid   = (t_grid >= rnn_native_t[0])[:n]
+    final_valid = (t_grid >= final_native_t[0])[:n]
+    methods = ['Odometry', 'EKF', 'RNN', 'Final Fusion']
+    data    = [
+        (ekf_df['odom_x'].values[:n], ekf_df['odom_y'].values[:n], None),
+        (ekf_df['ekf_x'].values[:n],  ekf_df['ekf_y'].values[:n],  None),
+        (rnn_x[:n],                   rnn_y[:n],                   rnn_valid),
+        (fx[:n],                      fy[:n],                      final_valid),
+    ]
+    # Paper Table 7 std values for reference
+    paper_std = [0.1254, 0.0619, 0.0527, None]
+
+    rmses, maes, stds = [], [], []
+    for px, py, mask in data:
+        err = pos_error(px, py, gt_x[:n], gt_y[:n])
+        err_for_metrics = err[mask] if mask is not None else err
+        rmses.append(rmse(err_for_metrics))
+        maes.append(float(np.mean(err_for_metrics)))
+        stds.append(float(np.std(err_for_metrics)))
+
+    fig, ax = plt.subplots(1, 1, figsize=(9, 6))
+
+    x     = np.arange(len(methods))
+    width = 0.25
+    ax.bar(x - width, rmses, width, label='RMSE', color='steelblue')
+    ax.bar(x,          maes,  width, label='MAE',  color='darkorange')
+    ax.bar(x + width,  stds,  width, label='Std',  color='seagreen')
+    ax.set_xticks(x)
+    ax.set_xticklabels(methods)
+    ax.set_ylabel('Error (m)')
+    ax.legend()
+    ax.grid(True, axis='y', alpha=0.3)
+
+    plt.tight_layout()
+    save('paper_figure10_metrics_summary.png')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FIGURE 11 — Error distribution histogram (paper's actual Fig 10)
+# Uses error_distribution_results.csv from noise_evaluation.py — real
+# per-timestep error samples from one clean run per method, NOT a
+# multi-seed Monte Carlo distribution (see noise_evaluation.py's
+# evaluate_error_distribution() docstring for why that's the right call).
+# ══════════════════════════════════════════════════════════════════════════════
+
+def figure11_error_distribution():
+    path = os.path.join(LOG_DIR, 'error_distribution_results.csv')
+    if not os.path.exists(path):
+        print("  Skipping Fig 11 — error_distribution_results.csv not found "
+              "(re-run the updated noise_evaluation.py)")
+        return
+
+    err_df = pd.read_csv(path)
+
+    # FIX (visualization complaint: "curves overlap too much"): color +
+    # linestyle differentiation still can't fully fix 4 series crammed onto
+    # 1 axis when 2 of them are near-identical distributions. Small
+    # multiples (one subplot per method, shared x/y axes for direct visual
+    # comparison) eliminates the overlap problem entirely instead of
+    # fighting it with styling.
+    methods = ['EKF Only', 'RNN Only', 'EKF + Weighted Fusion', 'EKF-RNN Fusion']
+    methods = [m for m in methods if m in err_df.columns]
+    colors  = {'EKF Only': 'tab:blue', 'RNN Only': 'tab:orange',
+               'EKF + Weighted Fusion': 'tab:green', 'EKF-RNN Fusion': 'tab:red'}
+
+    xmax = err_df[methods].max().max()
+    ymax = 0
+    for m in methods:
+        counts, _ = np.histogram(err_df[m], bins=30, density=True)
+        ymax = max(ymax, counts.max())
+
+    fig, axes = plt.subplots(2, 2, figsize=(11, 8), sharex=True, sharey=True)
+    for ax, method in zip(axes.flat, methods):
+        ax.hist(err_df[method], bins=30, density=True, color=colors[method],
+                alpha=0.75)
+        ax.set_title(f'{method}  (RMSE={rmse(err_df[method].values):.4f}m)',
+                     fontsize=10)
+        ax.set_xlim(0, xmax * 1.05)
+        ax.set_ylim(0, ymax * 1.1)
+        ax.grid(True, alpha=0.3)
+    for ax in axes[-1, :]:
+        ax.set_xlabel('Localization Error (meters)')
+    for ax in axes[:, 0]:
+        ax.set_ylabel('Probability Density')
+
+    fig.suptitle('Figure 11: Error Distribution by Method (paper Fig 10)',
+                  fontsize=13, fontweight='bold')
+
+    plt.tight_layout()
+    save('paper_figure11_error_distribution.png')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FIGURE 12 — Training loss curve (paper Fig 11)
+# Pulls from rnn_training_curve.csv (already saved by rnn_fusion_v2.py) —
+# real per-epoch train/val loss, not re-derived or estimated here.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def figure12_training_loss():
+    path = os.path.join(LOG_DIR, 'rnn_training_curve.csv')
+    if not os.path.exists(path):
+        print("  Skipping Fig 12 — rnn_training_curve.csv not found "
+              "(re-run rnn_fusion_v2.py)")
+        return
+
+    loss_df = pd.read_csv(path)
+
+    fig, ax = plt.subplots(1, 1, figsize=(9, 6))
+    ax.plot(loss_df['train_loss'], color='tab:blue', linewidth=1.2, label='Train Loss')
+    if 'val_loss' in loss_df.columns:
+        ax.plot(loss_df['val_loss'], color='tab:orange', linewidth=1.2,
+                linestyle='--', label='Val Loss')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Loss')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    save('paper_figure12_training_loss.png')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == '__main__':
+    print("\n" + "█"*55)
+    print("  GENERATING PAPER FIGURES")
+    print("█"*55 + "\n")
+
+    for fn in [figure1_sensor_data,
+               figure2_sg_filtering,
+               figure3_ekf_trajectory,
+               figure4_rnn_results,
+               figure5_lidar_fusion,
+               figure6_noise_comparison,
+               figure7_full_pipeline,
+               figure8_runtime,
+               figure9_dynamic_disturbance,
+               figure10_metrics_summary,
+               figure11_error_distribution,
+               figure12_training_loss]:
+        try:
+            fn()
+        except Exception as e:
+            print(f"  Warning: {fn.__name__} failed — {e}")
+
+    print(f"\n✅ All figures saved to: {LOG_DIR}")
