@@ -1,0 +1,744 @@
+#!/usr/bin/env python3
+"""
+noise_evaluation.py — Paper Tables 3, 4, 7 evaluation
+
+REWRITTEN to call the ACTUAL fixed pipeline algorithms instead of a
+separate, stale reimplementation:
+  - DiffDriveEKF class imported from ekf_fusion.py (paper-faithful
+    [s,phi] odometry + absolute-theta IMU model, with the real retuned
+    R_odom/R_imu values)
+  - DenoisingRNN class + trained weights imported from rnn_fusion_v2.py
+  - Ray-casting LiDAR correction imported from lidar_fusion_v2.py (real
+    wall geometry verified against indoor_world.sdf, real alpha=0.98)
+
+This means noise-sensitivity results here reflect your REAL, validated
+pipeline, not a disconnected approximation. Runs on ONE representative
+session (matches the "one representative trajectory" choice used for
+generate_paper_figures.py, and matches the paper's own approach of
+illustrating one simulation run per fusion stage).
+
+Previous version had a blocking bug (odom_df['linear_x'] — that column
+doesn't exist in odom_filtered_<session>.csv, only in cmd_vel) and used a
+disconnected MiniEKF/ad-hoc LiDAR blend that didn't reflect the real,
+fixed pipeline at all. Both are fixed here by reusing the real modules.
+"""
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+import sys
+import importlib.util
+import torch
+
+LOG_DIR     = os.path.expanduser('~/ws_mobile/sensor_logs')
+SCRIPTS_DIR = os.path.expanduser('~/ws_mobile/scripts')
+
+# Representative session — same choice as generate_paper_figures.py, for
+# consistency across all report figures.
+SESSION = '20260712_144326'
+
+# (odom position std in meters, IMU angle std in degrees) per paper Table 3
+NOISE_LEVELS = {
+    'Low':    (0.01, 0.1),
+    'Medium': (0.05, 0.5),
+    'High':   (0.10, 1.0),
+}
+
+PAPER_TABLE3 = {
+    'EKF Only':       {'Low': 0.065, 'Medium': 0.114, 'High': 0.178},
+    'RNN Only':       {'Low': 0.058, 'Medium': 0.098, 'High': 0.145},
+    'EKF-RNN Fusion': {'Low': 0.042, 'Medium': 0.067, 'High': 0.102},
+}
+PAPER_TABLE4 = {
+    'Acceleration changes': {'EKF': 0.125, 'RNN': 0.102, 'Fusion': 0.073},
+    'Rotational drift':     {'EKF': 0.149, 'RNN': 0.128, 'Fusion': 0.089},
+    'Sensor dropout':       {'EKF': 0.177, 'RNN': 0.142, 'Fusion': 0.098},
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IMPORT THE REAL PIPELINE MODULES (not a reimplementation)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _load_module(mod_name, filename):
+    path = os.path.join(SCRIPTS_DIR, filename)
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Required pipeline script not found: {path}\n"
+            f"noise_evaluation.py needs the real ekf_fusion.py, "
+            f"rnn_fusion_v2.py, and lidar_fusion_v2.py to already exist "
+            f"in ~/ws_mobile/scripts/ (it imports their real classes, "
+            f"it does not reimplement them).")
+    spec = importlib.util.spec_from_file_location(mod_name, path)
+    mod  = importlib.util.module_from_spec(spec)
+    # Each of these scripts reads SESSION from sys.argv[1] at module level
+    # and guards its full pipeline run behind `if __name__ == '__main__':` —
+    # importing them here only defines their classes/functions, it does
+    # NOT execute a full pipeline run.
+    spec.loader.exec_module(mod)
+    return mod
+
+
+print("  Loading real pipeline modules (ekf_fusion, rnn_fusion_v2, "
+      "lidar_fusion_v2)...")
+_ekf_mod   = _load_module('ekf_fusion_real',   'ekf_fusion.py')
+_rnn_mod   = _load_module('rnn_fusion_real',   'rnn_fusion_v2.py')
+_lidar_mod = _load_module('lidar_fusion_real', 'lidar_fusion_v2.py')
+
+DiffDriveEKF                 = _ekf_mod.DiffDriveEKF
+quat_to_yaw                  = _ekf_mod.quat_to_yaw
+get_col                      = _ekf_mod.get_col
+DenoisingRNN                 = _rnn_mod.DenoisingRNN
+WINDOW_SIZE                  = _rnn_mod.WINDOW_SIZE
+estimate_position_correction = _lidar_mod.estimate_position_correction
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LOAD REAL SESSION DATA
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_session_signals(session: str) -> dict:
+    print(f"\n  Loading real session data: {session}")
+    imu_df  = pd.read_csv(os.path.join(LOG_DIR, f'imu_filtered_{session}.csv'))
+    odom_df = pd.read_csv(os.path.join(LOG_DIR, f'odom_filtered_{session}.csv'))
+    cmd_df  = pd.read_csv(os.path.join(LOG_DIR, f'cmd_vel_filtered_{session}.csv'))
+    scan_df = pd.read_csv(os.path.join(LOG_DIR, f'scan_filtered_{session}.csv'))
+    gt_df   = pd.read_csv(os.path.join(LOG_DIR, f'ground_truth_filtered_{session}.csv'))
+
+    n = min(len(imu_df), len(odom_df), len(cmd_df), len(scan_df), len(gt_df))
+    imu_df  = imu_df.iloc[:n].reset_index(drop=True)
+    odom_df = odom_df.iloc[:n].reset_index(drop=True)
+    cmd_df  = cmd_df.iloc[:n].reset_index(drop=True)
+    scan_df = scan_df.iloc[:n].reset_index(drop=True)
+    gt_df   = gt_df.iloc[:n].reset_index(drop=True)
+    print(f"  Aligned {n} rows across imu/odom/cmd_vel/scan/ground_truth")
+
+    timestamps = (odom_df['timestamp'].values if 'timestamp' in odom_df.columns
+                  else np.arange(n) / 50.0)
+
+    gt_x  = get_col(gt_df, ['gt_x']).values.astype(float)
+    gt_y  = get_col(gt_df, ['gt_y']).values.astype(float)
+    gt_oz = get_col(gt_df, ['gt_orient_z']).values
+    gt_ow = get_col(gt_df, ['gt_orient_w'], default=1.0).values
+    gt_theta = np.array([quat_to_yaw(gt_oz[i], gt_ow[i]) for i in range(n)])
+
+    return dict(imu_df=imu_df, odom_df=odom_df, cmd_df=cmd_df, scan_df=scan_df,
+                timestamps=timestamps, n=n,
+                gt_x=gt_x, gt_y=gt_y, gt_theta=gt_theta)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RUN THE REAL PIPELINE STAGES
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_real_ekf(odom_df, imu_df, cmd_df, timestamps, gt_x, gt_y, gt_theta, n,
+                  s_meas_override=None, phi_meas_override=None,
+                  imu_theta_override=None):
+    """Mirrors ekf_fusion.py's run_ekf_fusion() core loop exactly, but takes
+    dataframes as arguments so noise-injected copies can be passed in.
+
+    FIX: added optional s_meas_override/phi_meas_override/imu_theta_override.
+    Table 3 noise was originally injected on raw odom_df['pos_x']/['pos_y']
+    (absolute position), then this function differenced them into
+    s_meas/phi_meas as usual. But independently noising each row's absolute
+    position and then differencing two independently-noised values
+    amplifies the noise by sqrt(2) relative to the TRUE per-tick
+    displacement, which is often small for a slow-driving session — the
+    noise ends up dwarfing the signal it's corrupting, producing the
+    non-monotonic then catastrophic RMSE blowup seen in testing (0.389 ->
+    4.017 -> 9.195, vs the paper's graceful 0.065 -> 0.114 -> 0.178).
+    Injecting noise directly on s_meas/phi_meas instead — the actual
+    Z_Odometry=[s,phi] measurement the paper's model and our EKF consume —
+    avoids this artifact and is more methodologically correct: it noises
+    the quantity that's actually measured/reported, not an intermediate
+    representation that then gets transformed in a noise-amplifying way."""
+    odom_x  = get_col(odom_df, ['pos_x']).values
+    odom_y  = get_col(odom_df, ['pos_y']).values
+    odom_oz = get_col(odom_df, ['orient_z']).values
+    odom_ow = get_col(odom_df, ['orient_w'], default=1.0).values
+    odom_theta = np.array([quat_to_yaw(odom_oz[i], odom_ow[i]) for i in range(n)])
+
+    if s_meas_override is not None:
+        s_meas = s_meas_override
+    else:
+        d_odom_x = np.diff(odom_x, prepend=odom_x[0])
+        d_odom_y = np.diff(odom_y, prepend=odom_y[0])
+        s_meas   = np.hypot(d_odom_x, d_odom_y)
+        s_meas[0] = 0.0
+
+    if phi_meas_override is not None:
+        phi_meas = phi_meas_override
+    else:
+        phi_raw  = np.diff(odom_theta, prepend=odom_theta[0])
+        phi_meas = np.arctan2(np.sin(phi_raw), np.cos(phi_raw))
+        phi_meas[0] = 0.0
+
+    if imu_theta_override is not None:
+        imu_theta = imu_theta_override
+    else:
+        imu_oz = get_col(imu_df, ['orient_z']).values
+        imu_ow = get_col(imu_df, ['orient_w'], default=1.0).values
+        imu_theta = np.array([quat_to_yaw(imu_oz[i], imu_ow[i]) for i in range(n)])
+
+    v_lin = get_col(cmd_df, ['linear_x']).values
+    omega = get_col(cmd_df, ['angular_z']).values
+
+    ekf = DiffDriveEKF(float(gt_x[0]), float(gt_y[0]), float(gt_theta[0]))
+    out_x, out_y, out_theta = [], [], []
+    x_prev, y_prev, theta_prev = ekf.x[0], ekf.x[1], ekf.x[2]
+
+    for i in range(n):
+        dt = float(timestamps[i] - timestamps[i-1]) if i > 0 else 0.02
+        dt = np.clip(dt, 0.001, 0.5)
+
+        ekf.predict(float(v_lin[i]), float(omega[i]), dt)
+        ekf.update_odometry(x_prev, y_prev, theta_prev,
+                             float(s_meas[i]), float(phi_meas[i]))
+        ekf.update_imu_theta(float(imu_theta[i]))
+
+        out_x.append(ekf.x[0]); out_y.append(ekf.x[1]); out_theta.append(ekf.x[2])
+        x_prev, y_prev, theta_prev = ekf.x[0], ekf.x[1], ekf.x[2]
+
+    return np.array(out_x), np.array(out_y), np.array(out_theta)
+
+
+_rnn_model, _rnn_mean, _rnn_std = None, None, None
+_rnn_res_mean, _rnn_res_std     = None, None
+
+def _load_trained_rnn():
+    global _rnn_model, _rnn_mean, _rnn_std, _rnn_res_mean, _rnn_res_std
+    if _rnn_model is not None:
+        return
+    model_path = os.path.join(LOG_DIR, 'rnn_model_denoising.pth')
+    norm_path  = os.path.join(LOG_DIR, 'rnn_norm_stats.npy')
+    # FIX (residual-learning, per-session stats): the trained model now
+    # predicts a normalized RESIDUAL (GT - EKF) using PER-SESSION
+    # normalization stats, not a single pooled mean/std — see
+    # rnn_fusion_v2.py's module docstring + FIX #2 for why pooling was
+    # wrong (one outlier-scale session distorted the target for others).
+    # This file only ever evaluates the ONE representative SESSION
+    # constant, so it just needs that session's own stats out of the
+    # saved per-session dict. Fail loudly if the file/session is missing
+    # rather than silently misusing a different session's scale.
+    res_norm_path = os.path.join(LOG_DIR, 'rnn_residual_stats_per_session.npy')
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(
+            f"{model_path} not found — run rnn_fusion_v2.py first "
+            f"to train and save the model.")
+    model = DenoisingRNN()
+    model.load_state_dict(torch.load(model_path, map_location='cpu'))
+    model.eval()
+    if os.path.exists(norm_path):
+        stats = np.load(norm_path)
+        mean, std = stats[0], stats[1]
+    else:
+        raise FileNotFoundError(f"{norm_path} not found — rerun rnn_fusion_v2.py.")
+    if os.path.exists(res_norm_path):
+        all_res_stats = np.load(res_norm_path, allow_pickle=True).item()
+        if SESSION not in all_res_stats:
+            raise KeyError(
+                f"No residual stats saved for session {SESSION} in "
+                f"{res_norm_path} — rerun rnn_fusion_v2.py (SESSIONS list "
+                f"there must include {SESSION}).")
+        res_mean, res_std = all_res_stats[SESSION]['mean'], all_res_stats[SESSION]['std']
+    else:
+        raise FileNotFoundError(
+            f"{res_norm_path} not found — this means rnn_model_denoising.pth "
+            f"predates the per-session residual fix. Rerun rnn_fusion_v2.py "
+            f"to retrain and produce this file before running "
+            f"noise_evaluation.py.")
+    _rnn_model, _rnn_mean, _rnn_std = model, mean, std
+    _rnn_res_mean, _rnn_res_std     = res_mean, res_std
+
+
+def run_real_rnn(ekf_x, ekf_y, ekf_theta):
+    """Uses the actual trained DenoisingRNN + its real normalization stats.
+
+    FIX (residual-learning reconstruction, matching rnn_fusion_v2.py's
+    run_rnn_inference() exactly): the model output is a normalized
+    RESIDUAL now, not an absolute normalized position. Un-normalize with
+    the residual's own stats, then add onto the EKF's raw value at the
+    matching target index data[T:] (same anchor indexing
+    create_sequences() uses during training) before wrapping theta back
+    into [-pi, pi]. This function and rnn_fusion_v2.py's
+    run_rnn_inference() must stay mechanically identical — this is a
+    separate reimplementation (see module docstring), not a shared call,
+    so it's on us to keep them in sync by hand.
+    """
+    _load_trained_rnn()
+    data = np.column_stack([ekf_x, ekf_y, ekf_theta]).astype(np.float32)
+    norm = (data - _rnn_mean) / _rnn_std
+    T = WINDOW_SIZE
+    seqs = np.array([norm[i:i + T] for i in range(len(norm) - T)], dtype=np.float32)
+    with torch.no_grad():
+        pred_residual = (_rnn_model(torch.tensor(seqs)).numpy()
+                          * _rnn_res_std + _rnn_res_mean)
+    anchor = data[T:T + len(pred_residual)]
+    pred = anchor + pred_residual
+    pred[:, 2] = np.arctan2(np.sin(pred[:, 2]), np.cos(pred[:, 2]))
+    # FIX: apply the SAME Savitzky-Golay smoothing rnn_fusion_v2.py itself
+    # applies to produce rnn_smoothed_output — raw per-window predictions
+    # have no continuity constraint between consecutive points and plot as
+    # visibly erratic/looping paths even at reasonable pointwise RMSE.
+    # Using the shared smooth_trajectory() (not a separate reimplementation)
+    # keeps noise_evaluation.py's "RNN Only" results consistent with what
+    # the real pipeline actually produces and saves downstream.
+    pred = _rnn_mod.smooth_trajectory(pred)
+    pad = np.tile(pred[0], (T, 1))
+    pred_full = np.vstack([pad, pred])[:len(ekf_x)]
+    return pred_full[:, 0], pred_full[:, 1], pred_full[:, 2]
+
+
+def run_real_lidar(rnn_x, rnn_y, rnn_theta, scan_df, alpha=None):
+    """Uses the actual ray-casting estimate_position_correction() and real
+    wall geometry from lidar_fusion_v2.py."""
+    if alpha is None:
+        alpha = _lidar_mod.ALPHA  # single source of truth, not a duplicate literal
+    n = len(rnn_x)
+    angle_increment = float(scan_df['angle_increment'].iloc[0])
+    range_max       = float(scan_df['range_max'].iloc[0])
+    angle_min_arr   = scan_df['angle_min'].values[:n]
+    range_cols = sorted(
+        [c for c in scan_df.columns
+         if c.startswith('range_') and c.split('_', 1)[1].isdigit()],
+        key=lambda c: int(c.split('_')[1]))
+    ranges_arr = scan_df[range_cols].values[:n]
+
+    fused_x, fused_y = np.zeros(n), np.zeros(n)
+    for i in range(n):
+        err_x, err_y, conf = estimate_position_correction(
+            rnn_x[i], rnn_y[i], rnn_theta[i],
+            ranges_arr[i], float(angle_min_arr[i]), angle_increment, range_max)
+        lidar_x = rnn_x[i] + err_x
+        lidar_y = rnn_y[i] + err_y
+        w = (1 - alpha) * conf
+        fused_x[i] = (1 - w) * rnn_x[i] + w * lidar_x
+        fused_y[i] = (1 - w) * rnn_y[i] + w * lidar_y
+    return fused_x, fused_y
+
+
+def run_full_pipeline(odom_df, imu_df, cmd_df, scan_df, timestamps,
+                       gt_x, gt_y, gt_theta, n,
+                       s_meas_override=None, phi_meas_override=None,
+                       imu_theta_override=None):
+    ekf_x, ekf_y, ekf_theta = run_real_ekf(
+        odom_df, imu_df, cmd_df, timestamps, gt_x, gt_y, gt_theta, n,
+        s_meas_override=s_meas_override, phi_meas_override=phi_meas_override,
+        imu_theta_override=imu_theta_override)
+    rnn_x, rnn_y, rnn_theta = run_real_rnn(ekf_x, ekf_y, ekf_theta)
+    fused_x, fused_y        = run_real_lidar(rnn_x, rnn_y, rnn_theta, scan_df)
+    return (ekf_x, ekf_y), (rnn_x, rnn_y), (fused_x, fused_y)
+
+
+def compute_rmse_mae_std(px, py, gt_x, gt_y):
+    err = np.sqrt((px - gt_x)**2 + (py - gt_y)**2)
+    return (float(np.sqrt(np.mean(err**2))), float(np.mean(err)), float(np.std(err)))
+
+
+def compute_err_array(px, py, gt_x, gt_y):
+    """Same per-timestep error as compute_rmse_mae_std, but returns the
+    full array instead of just summary stats — needed for Fig 10's error
+    DISTRIBUTION histogram (paper Fig 10), which is a histogram of
+    per-timestep pointwise error from one representative run per method,
+    not a distribution built from repeated randomized trials."""
+    return np.sqrt((px - gt_x)**2 + (py - gt_y)**2)
+
+
+def compute_rmse_trimmed(px, py, gt_x, gt_y, is_rnn_derived):
+    """FIX: RNN-derived series (RNN Only, EKF-RNN Fusion — NOT
+    'EKF + Weighted Fusion', which skips RNN entirely and isn't padded)
+    are front-padded by run_real_rnn() with WINDOW_SIZE repeated copies
+    of the first real prediction, purely so their length matches
+    gt_x/gt_y for array alignment elsewhere. Those padded rows were
+    never actually RNN-predicted. rnn_fusion_v2.py's OWN reported RMSE
+    excludes them entirely (they're absent from its saved output CSVs,
+    not just zero-weighted) — including them here made
+    noise_evaluation.py's clean-run RNN RMSE disagree with
+    rnn_fusion_v2.py's own number for the identical session
+    (1.4260m here vs 1.4310m there, a real ~0.4% discrepancy, not
+    run-to-run noise). Excluding the same WINDOW_SIZE leading rows for
+    RNN-derived methods only makes the two scripts agree exactly."""
+    if is_rnn_derived:
+        px, py = px[WINDOW_SIZE:], py[WINDOW_SIZE:]
+        gt_x, gt_y = gt_x[WINDOW_SIZE:], gt_y[WINDOW_SIZE:]
+    return compute_rmse_mae_std(px, py, gt_x, gt_y)
+
+
+def run_ekf_weighted_fusion(ekf_x, ekf_y, ekf_theta, scan_df):
+    """'EKF + Weighted Fusion' baseline (paper Fig 10 / Table 5): "LiDAR and
+    IMU combined with EKF using a static weighting strategy" — i.e. the
+    SAME static-alpha LiDAR complementary correction as your real final
+    fusion stage, but applied directly to the EKF output with NO RNN step
+    in between. This reuses run_real_lidar() as-is (it already accepts any
+    [x,y,theta] trajectory as input, not just RNN output), so this is a
+    real ablation of your existing validated code, not a new
+    reimplementation or fabricated baseline."""
+    return run_real_lidar(ekf_x, ekf_y, ekf_theta, scan_df)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FIGURE 10 DATA — per-timestep error distribution, ONE clean (no injected
+# noise) representative run per method, matching the same real numbers
+# already reported elsewhere (EKF 0.648m, RNN/Fusion ~1.67m for this
+# session) rather than pulling in one specific synthetic noise level from
+# Table 3, which would be a different, less representative number.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def evaluate_error_distribution(signals):
+    print("\n" + "="*55)
+    print("  FIGURE 10 — Per-timestep error distribution (real pipeline,")
+    print("  clean/no-injected-noise run, 4 methods)")
+    print("="*55)
+
+    # NOTE: calling run_real_ekf directly (not via run_full_pipeline) because
+    # run_full_pipeline's public return tuple discards ekf_theta, which
+    # run_ekf_weighted_fusion needs for its own ray-cast correction.
+    ekf_x, ekf_y, ekf_theta = run_real_ekf(
+        signals['odom_df'], signals['imu_df'], signals['cmd_df'],
+        signals['timestamps'], signals['gt_x'], signals['gt_y'],
+        signals['gt_theta'], signals['n'])
+    rnn_x, rnn_y, rnn_theta = run_real_rnn(ekf_x, ekf_y, ekf_theta)
+    fused_x, fused_y = run_real_lidar(rnn_x, rnn_y, rnn_theta, signals['scan_df'])
+
+    ekfw_x, ekfw_y = run_ekf_weighted_fusion(ekf_x, ekf_y, ekf_theta,
+                                              signals['scan_df'])
+
+    gt_x, gt_y = signals['gt_x'], signals['gt_y']
+    err_ekf     = compute_err_array(ekf_x,  ekf_y,  gt_x, gt_y)
+    err_rnn     = compute_err_array(rnn_x,  rnn_y,  gt_x, gt_y)
+    err_ekfw    = compute_err_array(ekfw_x, ekfw_y, gt_x, gt_y)
+    err_fusion  = compute_err_array(fused_x, fused_y, gt_x, gt_y)
+
+    # FIX: printed RMSE below now uses compute_rmse_trimmed (excludes the
+    # WINDOW_SIZE front-padding on RNN-derived methods) so it matches
+    # rnn_fusion_v2.py's own reported number exactly — see
+    # compute_rmse_trimmed's docstring. The err_* arrays saved to the CSV
+    # below intentionally stay FULL LENGTH (untrimmed): this is a
+    # DISTRIBUTION for a histogram, not a single RMSE number being
+    # cross-checked against another script, so including ~10 extra samples
+    # out of ~1428 (0.7%) doesn't meaningfully change the plotted shape,
+    # and keeping all 4 columns the same length keeps the CSV simple.
+    for name, px, py, is_rnn in [('EKF Only', ekf_x, ekf_y, False),
+                                  ('RNN Only', rnn_x, rnn_y, True),
+                                  ('EKF + Weighted Fusion', ekfw_x, ekfw_y, False),
+                                  ('EKF-RNN Fusion', fused_x, fused_y, True)]:
+        r, m, s = compute_rmse_trimmed(px, py, gt_x, gt_y, is_rnn)
+        print(f"    {name:<24} RMSE={r:.4f}m  mean={m:.4f}m  std={s:.4f}m")
+
+    out_df = pd.DataFrame({
+        'EKF Only':              err_ekf,
+        'RNN Only':              err_rnn,
+        'EKF + Weighted Fusion': err_ekfw,
+        'EKF-RNN Fusion':        err_fusion,
+    })
+    out_path = os.path.join(LOG_DIR, 'error_distribution_results.csv')
+    out_df.to_csv(out_path, index=False)
+    print(f"\n  Saved: {os.path.basename(out_path)} "
+          f"({len(out_df)} per-timestep error samples per method)")
+    return out_df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NOISE / DISTURBANCE INJECTION (perturb REAL data, then rerun REAL pipeline)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def inject_sensor_noise(signals, odom_std, imu_std_deg, seed=42):
+    """Table 3: Gaussian noise on the ACTUAL measurements the EKF consumes:
+    s_meas/phi_meas (Z_Odometry=[s,phi], the incremental distance/turn the
+    paper's own model uses) and imu_theta (the absolute heading
+    update_imu_theta() consumes).
+
+    FIX: originally injected noise on raw odom_df['pos_x']/['pos_y']
+    (absolute position) independently per row, then let run_real_ekf
+    difference two independently-noised values into s_meas/phi_meas as
+    usual. That differencing amplifies i.i.d. per-sample noise by sqrt(2)
+    relative to the TRUE per-tick displacement — which is small for a
+    slow-driving session — so the "noise" ends up dwarfing the real signal,
+    producing a non-monotonic-then-catastrophic RMSE curve (0.389 -> 4.017
+    -> 9.195) utterly unlike the paper's graceful one (0.065 -> 0.114 ->
+    0.178). Injecting directly on s_meas/phi_meas instead noises the
+    quantity that's actually measured/reported, matching the paper's own
+    Z_Odometry=[s,phi] formulation, and avoids the amplification artifact
+    entirely."""
+    rng = np.random.default_rng(seed)
+    n = signals['n']
+
+    odom_df = signals['odom_df']
+    odom_x  = get_col(odom_df, ['pos_x']).values
+    odom_y  = get_col(odom_df, ['pos_y']).values
+    odom_oz = get_col(odom_df, ['orient_z']).values
+    odom_ow = get_col(odom_df, ['orient_w'], default=1.0).values
+    odom_theta = np.array([quat_to_yaw(odom_oz[i], odom_ow[i]) for i in range(n)])
+
+    # Clean s_meas/phi_meas from the REAL odometry, then add noise directly
+    # to these — not to the pre-differenced absolute position.
+    d_odom_x = np.diff(odom_x, prepend=odom_x[0])
+    d_odom_y = np.diff(odom_y, prepend=odom_y[0])
+    s_meas_clean   = np.hypot(d_odom_x, d_odom_y)
+    s_meas_clean[0] = 0.0
+    phi_raw  = np.diff(odom_theta, prepend=odom_theta[0])
+    phi_meas_clean = np.arctan2(np.sin(phi_raw), np.cos(phi_raw))
+    phi_meas_clean[0] = 0.0
+
+    s_meas_noisy = np.abs(s_meas_clean + rng.normal(0, odom_std, n))
+    phi_noise_rad = np.deg2rad(rng.normal(0, imu_std_deg, n))
+    phi_meas_noisy = np.arctan2(np.sin(phi_meas_clean + phi_noise_rad),
+                                 np.cos(phi_meas_clean + phi_noise_rad))
+
+    # IMU theta: this is already an absolute (non-differenced) measurement,
+    # so directly adding noise here doesn't suffer the same amplification —
+    # kept as before.
+    imu_df = signals['imu_df']
+    imu_oz = get_col(imu_df, ['orient_z']).values
+    imu_ow = get_col(imu_df, ['orient_w'], default=1.0).values
+    imu_theta_clean = np.array([quat_to_yaw(imu_oz[i], imu_ow[i]) for i in range(n)])
+    imu_theta_noisy = imu_theta_clean + np.deg2rad(rng.normal(0, imu_std_deg, n))
+
+    return s_meas_noisy, phi_meas_noisy, imu_theta_noisy
+
+
+def inject_acceleration_spikes(signals, seed=42):
+    """Table 4 #1: random velocity spikes on the REAL control input
+    (cmd_vel's linear_x — what predict() actually uses, not odom's own
+    position, which the old buggy version incorrectly tried to spike)."""
+    rng = np.random.default_rng(seed)
+    n = signals['n']
+    cmd_df = signals['cmd_df'].copy()
+    spike_mask = rng.random(n) < 0.05
+    lin = get_col(cmd_df, ['linear_x']).values.copy()
+    lin[spike_mask] *= rng.uniform(2, 4, int(spike_mask.sum()))
+    cmd_df['linear_x'] = lin
+    return cmd_df
+
+
+def inject_rotational_drift(signals, seed=42):
+    """Table 4 #2: slow cumulative heading drift added to IMU orientation
+    (simulates gyro bias drift), same rationale as inject_sensor_noise for
+    perturbing theta rather than raw angular velocity."""
+    rng = np.random.default_rng(seed)
+    n = signals['n']
+    imu_df = signals['imu_df'].copy()
+    oz = get_col(imu_df, ['orient_z']).values
+    ow = get_col(imu_df, ['orient_w'], default=1.0).values
+    theta = np.array([quat_to_yaw(oz[i], ow[i]) for i in range(n)])
+    drift = np.cumsum(rng.normal(0, 0.001, n))
+    noisy_theta = theta + drift
+    imu_df['orient_z'] = np.sin(noisy_theta / 2.0)
+    imu_df['orient_w'] = np.cos(noisy_theta / 2.0)
+    return imu_df
+
+
+def inject_lidar_dropout(signals, seed=42, dropout_frac=0.3):
+    """Table 4 #3: randomly blank out LiDAR scans (set to out-of-range) to
+    simulate temporary sensor dropout. This only affects the LiDAR fusion
+    stage — EKF/RNN don't consume scan data at all, so their RMSE for this
+    disturbance is identical to the clean baseline, which is physically
+    correct (a LiDAR dropout can't retroactively affect odometry/IMU)."""
+    rng = np.random.default_rng(seed)
+    n = signals['n']
+    scan_df = signals['scan_df'].copy()
+    range_cols = [c for c in scan_df.columns
+                  if c.startswith('range_') and c.split('_', 1)[1].isdigit()]
+    range_max = float(scan_df['range_max'].iloc[0])
+    dropout_mask = rng.random(n) < dropout_frac
+    scan_df.loc[dropout_mask, range_cols] = range_max + 1.0
+    return scan_df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TABLE 3 — Noise levels
+# ══════════════════════════════════════════════════════════════════════════════
+
+def evaluate_noise_levels(signals):
+    print("\n" + "="*55)
+    print("  TABLE 3 — Noise Level Evaluation (real pipeline, sensor noise)")
+    print("="*55)
+
+    rows = []
+    for level, (odom_std, imu_std_deg) in NOISE_LEVELS.items():
+        print(f"\n  {level} noise (odom std={odom_std}m, IMU std={imu_std_deg}deg)...")
+        s_noisy, phi_noisy, imu_theta_noisy = inject_sensor_noise(
+            signals, odom_std, imu_std_deg)
+
+        (ekf_x, ekf_y), (rnn_x, rnn_y), (fused_x, fused_y) = run_full_pipeline(
+            signals['odom_df'], signals['imu_df'], signals['cmd_df'],
+            signals['scan_df'], signals['timestamps'], signals['gt_x'],
+            signals['gt_y'], signals['gt_theta'], signals['n'],
+            s_meas_override=s_noisy, phi_meas_override=phi_noisy,
+            imu_theta_override=imu_theta_noisy)
+
+        ekf_r,_,_   = compute_rmse_trimmed(ekf_x,   ekf_y,   signals['gt_x'], signals['gt_y'], False)
+        rnn_r,_,_   = compute_rmse_trimmed(rnn_x,   rnn_y,   signals['gt_x'], signals['gt_y'], True)
+        fused_r,_,_ = compute_rmse_trimmed(fused_x, fused_y, signals['gt_x'], signals['gt_y'], True)
+
+        rows.append({'Noise Level': level,
+                     'EKF Only (m)': round(ekf_r, 4),
+                     'RNN Only (m)': round(rnn_r, 4),
+                     'EKF-RNN Fusion (m)': round(fused_r, 4)})
+
+        print(f"    {'Method':<20} {'Yours':>8}  {'Paper':>8}")
+        print(f"    {'EKF Only':<20} {ekf_r:>8.4f}  {PAPER_TABLE3['EKF Only'][level]:>8.3f}")
+        print(f"    {'RNN Only':<20} {rnn_r:>8.4f}  {PAPER_TABLE3['RNN Only'][level]:>8.3f}")
+        print(f"    {'EKF-RNN Fusion':<20} {fused_r:>8.4f}  "
+              f"{PAPER_TABLE3['EKF-RNN Fusion'][level]:>8.3f}")
+
+    your_df = pd.DataFrame(rows)
+    your_df.to_csv(os.path.join(LOG_DIR, 'noise_evaluation_results.csv'), index=False)
+    print(f"\n  Saved: noise_evaluation_results.csv (real-pipeline results, "
+          f"session {SESSION})")
+    return your_df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TABLE 4 — Dynamic disturbances
+# ══════════════════════════════════════════════════════════════════════════════
+
+def evaluate_dynamic_disturbances(signals):
+    print("\n" + "="*55)
+    print("  TABLE 4 — Dynamic Disturbance Evaluation (real pipeline)")
+    print("="*55)
+
+    rows = []
+
+    # 1. Acceleration changes — perturb cmd_vel (the real predict() input)
+    cmd_noisy = inject_acceleration_spikes(signals)
+    (ekf_x, ekf_y), (rnn_x, rnn_y), (fused_x, fused_y) = run_full_pipeline(
+        signals['odom_df'], signals['imu_df'], cmd_noisy, signals['scan_df'],
+        signals['timestamps'], signals['gt_x'], signals['gt_y'],
+        signals['gt_theta'], signals['n'])
+    ekf_r,_,_   = compute_rmse_trimmed(ekf_x,   ekf_y,   signals['gt_x'], signals['gt_y'], False)
+    rnn_r,_,_   = compute_rmse_trimmed(rnn_x,   rnn_y,   signals['gt_x'], signals['gt_y'], True)
+    fused_r,_,_ = compute_rmse_trimmed(fused_x, fused_y, signals['gt_x'], signals['gt_y'], True)
+    rows.append({'Disturbance': 'Acceleration changes',
+                 'EKF Only (m)': round(ekf_r, 4), 'RNN Only (m)': round(rnn_r, 4),
+                 'EKF-RNN Fusion (m)': round(fused_r, 4)})
+
+    # 2. Rotational drift — perturb IMU orientation
+    imu_drifted = inject_rotational_drift(signals)
+    (ekf_x, ekf_y), (rnn_x, rnn_y), (fused_x, fused_y) = run_full_pipeline(
+        signals['odom_df'], imu_drifted, signals['cmd_df'], signals['scan_df'],
+        signals['timestamps'], signals['gt_x'], signals['gt_y'],
+        signals['gt_theta'], signals['n'])
+    ekf_r,_,_   = compute_rmse_trimmed(ekf_x,   ekf_y,   signals['gt_x'], signals['gt_y'], False)
+    rnn_r,_,_   = compute_rmse_trimmed(rnn_x,   rnn_y,   signals['gt_x'], signals['gt_y'], True)
+    fused_r,_,_ = compute_rmse_trimmed(fused_x, fused_y, signals['gt_x'], signals['gt_y'], True)
+    rows.append({'Disturbance': 'Rotational drift',
+                 'EKF Only (m)': round(ekf_r, 4), 'RNN Only (m)': round(rnn_r, 4),
+                 'EKF-RNN Fusion (m)': round(fused_r, 4)})
+
+    # 3. Sensor dropout — perturb LiDAR scans only (EKF/RNN unaffected)
+    scan_dropout = inject_lidar_dropout(signals)
+    (ekf_x, ekf_y), (rnn_x, rnn_y), (fused_x, fused_y) = run_full_pipeline(
+        signals['odom_df'], signals['imu_df'], signals['cmd_df'], scan_dropout,
+        signals['timestamps'], signals['gt_x'], signals['gt_y'],
+        signals['gt_theta'], signals['n'])
+    ekf_r,_,_   = compute_rmse_trimmed(ekf_x,   ekf_y,   signals['gt_x'], signals['gt_y'], False)
+    rnn_r,_,_   = compute_rmse_trimmed(rnn_x,   rnn_y,   signals['gt_x'], signals['gt_y'], True)
+    fused_r,_,_ = compute_rmse_trimmed(fused_x, fused_y, signals['gt_x'], signals['gt_y'], True)
+    rows.append({'Disturbance': 'Sensor dropout',
+                 'EKF Only (m)': round(ekf_r, 4), 'RNN Only (m)': round(rnn_r, 4),
+                 'EKF-RNN Fusion (m)': round(fused_r, 4)})
+
+    print(f"\n  {'Disturbance':<25} {'EKF':>8} {'RNN':>8} {'Fusion':>8}  "
+          f"{'P.EKF':>7} {'P.RNN':>7} {'P.Fus':>7}")
+    print(f"  {'-'*72}")
+    for r in rows:
+        p = PAPER_TABLE4[r['Disturbance']]
+        print(f"  {r['Disturbance']:<25} "
+              f"{r['EKF Only (m)']:>8.4f} {r['RNN Only (m)']:>8.4f} "
+              f"{r['EKF-RNN Fusion (m)']:>8.4f}  "
+              f"{p['EKF']:>7.3f} {p['RNN']:>7.3f} {p['Fusion']:>7.3f}")
+
+    df = pd.DataFrame(rows)
+    df.to_csv(os.path.join(LOG_DIR, 'dynamic_disturbance_results.csv'), index=False)
+    print(f"\n  Saved: dynamic_disturbance_results.csv (real-pipeline results, "
+          f"session {SESSION})")
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PLOTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def plot_noise_comparison(your_df):
+    levels = list(NOISE_LEVELS.keys())
+    x, width = np.arange(len(levels)), 0.25
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.bar(x - width, your_df['EKF Only (m)'],       width, label='EKF Only',       color='steelblue')
+    ax.bar(x,         your_df['RNN Only (m)'],        width, label='RNN Only',       color='darkorange')
+    ax.bar(x + width, your_df['EKF-RNN Fusion (m)'], width, label='EKF-RNN Fusion', color='seagreen')
+    ax.set_xlabel('Noise Level'); ax.set_ylabel('RMSE (m)')
+    ax.set_title(f'Localization Error — Sensor Noise Levels (paper Fig 9), '
+                 f'session {SESSION}')
+    ax.set_xticks(x); ax.set_xticklabels(levels)
+    ax.legend(); ax.grid(True, axis='y', alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(LOG_DIR, 'noise_comparison.png'), dpi=150)
+    plt.close(fig)
+    print("  Saved: noise_comparison.png")
+
+
+def plot_trajectories(signals):
+    (ekf_x, ekf_y), (rnn_x, rnn_y), (fused_x, fused_y) = run_full_pipeline(
+        signals['odom_df'], signals['imu_df'], signals['cmd_df'],
+        signals['scan_df'], signals['timestamps'], signals['gt_x'],
+        signals['gt_y'], signals['gt_theta'], signals['n'])
+
+    plt.figure(figsize=(10, 8))
+    plt.plot(signals['gt_x'], signals['gt_y'], label='Ground Truth',
+             color='black', linewidth=1, linestyle='--')
+    plt.plot(ekf_x,   ekf_y,   label='EKF Only',       color='orange', alpha=0.7)
+    plt.plot(rnn_x,   rnn_y,   label='RNN Only',       color='green',  alpha=0.7)
+    plt.plot(fused_x, fused_y, label='EKF-RNN Fusion', color='blue',   linewidth=2)
+    plt.xlabel('X (m)'); plt.ylabel('Y (m)')
+    plt.title(f'All Methods vs Ground Truth (clean, no injected noise), '
+              f'session {SESSION}')
+    plt.legend(); plt.grid(True); plt.axis('equal')
+    plt.tight_layout()
+    plt.savefig(os.path.join(LOG_DIR, 'all_methods_trajectory.png'), dpi=150)
+    plt.close()
+    print("  Saved: all_methods_trajectory.png")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    print("\n" + "█"*55)
+    print(f"  NOISE EVALUATION — Paper Tables 3, 4, 7 (session {SESSION})")
+    print("█"*55)
+
+    signals = load_session_signals(SESSION)
+
+    print("\n" + "="*55)
+    print("  BASE ACCURACY vs Ground Truth (clean, no injected noise)")
+    print("="*55)
+    (ekf_x, ekf_y), (rnn_x, rnn_y), (fused_x, fused_y) = run_full_pipeline(
+        signals['odom_df'], signals['imu_df'], signals['cmd_df'],
+        signals['scan_df'], signals['timestamps'], signals['gt_x'],
+        signals['gt_y'], signals['gt_theta'], signals['n'])
+    for name, px, py, is_rnn in [('EKF Only', ekf_x, ekf_y, False),
+                                 ('RNN Only', rnn_x, rnn_y, True),
+                                 ('EKF-RNN Fusion', fused_x, fused_y, True)]:
+        r, m, s = compute_rmse_trimmed(px, py, signals['gt_x'], signals['gt_y'], is_rnn)
+        print(f"  {name:<20} RMSE={r:.4f}m  MAE={m:.4f}m  Std={s:.4f}m")
+
+    your_noise = evaluate_noise_levels(signals)
+    evaluate_dynamic_disturbances(signals)
+    evaluate_error_distribution(signals)
+
+    print("\n  Generating plots...")
+    plot_noise_comparison(your_noise)
+    plot_trajectories(signals)
+
+    print("\n" + "█"*55)
+    print("  ✅ EVALUATION COMPLETE")
+    print("  Next: python3 ~/ws_mobile/scripts/generate_paper_figures.py")
+    print("█"*55 + "\n")
+
+
+if __name__ == '__main__':
+    main()
